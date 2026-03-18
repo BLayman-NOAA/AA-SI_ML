@@ -3,23 +3,26 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "mypackagename"
+name = "aa-si-ml"
 version = "0.1.0"
-description = "A template Python package for NOAA Fisheries AA-SI projects."
+description = "Machine learning tools for NOAA Fisheries Active Acoustics Strategic Initiative sonar data analysis."
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
 authors = [
-    { name = "Your Name", email = "your.name@noaa.gov" },
+    { name = "NOAA Fisheries AA-SI" },
 ]
 maintainers = [
-    { name = "Your Name", email = "your.name@noaa.gov" },
+    { name = "NOAA Fisheries AA-SI" },
 ]
 keywords = [
     "noaa",
     "fisheries",
     "acoustics",
-    # TODO: Add your package-specific keywords
+    "machine-learning",
+    "clustering",
+    "sonar",
+    "echopype",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -34,9 +37,17 @@ classifiers = [
     "Topic :: Scientific/Engineering",
 ]
 dependencies = [
-    # Add your package dependencies here, e.g.:
-    # "numpy>=1.21.0",
-    # "pandas>=1.3.0",
+    "numpy>=1.21.0",
+    "xarray>=2022.3.0",
+    "pandas>=1.3.0",
+    "scikit-learn>=1.0.0",
+    "scipy>=1.7.0",
+    "hdbscan>=0.8.29",
+    "umap-learn>=0.5.0",
+    "matplotlib>=3.5.0",
+    "echopype>=0.8.0",
+    "aa-si-utils @ git+https://github.com/BLayman-NOAA/AA-SI_Utils.git",
+    "aa-si-visualization @ git+https://github.com/BLayman-NOAA/AA-SI_Visualization.git",
 ]
 
 [project.optional-dependencies]
@@ -54,11 +65,11 @@ docs = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/nmfs-ost/mypackagename"
-Documentation = "https://nmfs-ost.github.io/mypackagename/"
-Repository = "https://github.com/nmfs-ost/mypackagename.git"
-Issues = "https://github.com/nmfs-ost/mypackagename/issues"
-Changelog = "https://github.com/nmfs-ost/mypackagename/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/nmfs-ost/AA-SI_ML"
+Documentation = "https://nmfs-ost.github.io/AA-SI_ML/"
+Repository = "https://github.com/nmfs-ost/AA-SI_ML.git"
+Issues = "https://github.com/nmfs-ost/AA-SI_ML/issues"
+Changelog = "https://github.com/nmfs-ost/AA-SI_ML/blob/main/CHANGELOG.md"
 
 # =============================================================================
 # Tool Configuration
@@ -71,7 +82,7 @@ include = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/mypackagename"]
+packages = ["src/aa_si_ml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -83,7 +94,7 @@ addopts = [
 ]
 
 [tool.coverage.run]
-source = ["src/mypackagename"]
+source = ["src/aa_si_ml"]
 branch = true
 
 [tool.coverage.report]

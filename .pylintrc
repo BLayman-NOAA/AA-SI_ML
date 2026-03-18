@@ -6,7 +6,7 @@
 # Pylint checks for errors, enforces coding standards, and looks for code smells.
 #
 # USAGE:
-#   - Run pylint manually: pylint src/mypackagename
+#   - Run pylint manually: pylint src/aa_si_ml
 #   - Pylint runs automatically via pre-commit hooks (see .pre-commit-config.yaml)
 #   - Most IDEs (VS Code, PyCharm) can use this file for real-time linting
 #
