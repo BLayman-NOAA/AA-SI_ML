@@ -2117,7 +2117,9 @@ def data_preprocessing_pipeline(
         mvbs_nan_threshold=0.9,
         plot_window= [0, 1200, 0, 600],
         y_to_x_aspect_ratio_override=None,
-        remove_background_noise=True
+        remove_background_noise=True,
+        overlay_line_var=None,
+        overlay_line_path=None
         ):
     
     if remove_background_noise:
@@ -2146,14 +2148,19 @@ def data_preprocessing_pipeline(
         ping_time_bin=ping_time_bin  
     )
 
-    ds_MVBS = utils.add_dive_profile_to_dataset(
-        ds_MVBS,
-        'NEFSC_use_case_1_line_files/SpermWhaleClicks_click_data_HB1603_SpermWhaleDive_Span0.2_07252016_2120_UTC.csv'
-    )
+    overlay_lines = None
 
-    overlay_lines = [
-        {'var': 'dive_profile_fit', 'style': {'color': 'red', 'linewidth': 3.5}}
-    ]
+    if overlay_line_path is not None and overlay_line_var is not None:
+        ds_MVBS = utils.add_dive_profile_to_dataset(
+            ds_MVBS,
+            overlay_line_path,
+            overlay_line_var
+        )
+
+        overlay_lines = [
+            {'var': f'{overlay_line_var}_fit', 'style': {'color': 'red', 'linewidth': 3.5}}
+        ]
+
 
     echogram.plot_sv_echogram(
         ds_Sv_clean, 
@@ -2554,7 +2561,18 @@ def plot_dbscan_cluster_hierarchy(model, cluster_colors_by_index=None):
         print(f"  Noise (-1): {noise_count:,} points ({noise_percentage:.1f}%)")
     
     # Plot with correct color mapping
-    model.condensed_tree_.plot(select_clusters=True, selection_palette=palette_by_tree_order)
+    ax = model.condensed_tree_.plot(select_clusters=True, selection_palette=palette_by_tree_order)
+    # Fix HDBSCAN/matplotlib compatibility: Ellipse patches may have array-valued
+    # width/height which newer numpy (>=2.0) rejects during rendering.
+    from matplotlib.patches import Ellipse as _Ellipse
+    for patch in ax.patches:
+        if isinstance(patch, _Ellipse):
+            if isinstance(patch._width, np.ndarray):
+                patch._width = patch._width.item()
+            if isinstance(patch._height, np.ndarray):
+                patch._height = patch._height.item()
+            if isinstance(getattr(patch, '_center', None), np.ndarray):
+                patch._center = tuple(float(c) for c in patch._center)
     plt.title('HDBSCAN Condensed Tree')
     plt.show()
     
