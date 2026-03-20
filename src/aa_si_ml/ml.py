@@ -2285,7 +2285,8 @@ def extract_data_and_run_hdbscan(
         find_background_cluster=False,
         y_to_x_aspect_ratio_override=None,
         soft_membership_threshold=None, 
-        cluster_colors=None
+        cluster_colors=None,
+        overlay_line_var=None
         ):
 
     X, _, sample_indices = extract_valid_samples_for_sklearn(ds_normalized, custom_normalization_name, dataset_name=custom_dataset_name)
@@ -2315,10 +2316,12 @@ def extract_data_and_run_hdbscan(
     ds_final = store_ml_results_flattened(ds_normalized, dbscan_results[first_key]["labels"], ml_result_name, dataset_name=custom_dataset_name, result_sample_indices=dbscan_results[first_key]["sample_indices"])
 
     gridded_results_dbscan = extract_ml_data_gridded(ds_final, ml_result_name, dataset_name=custom_dataset_name, fill_value=np.nan, store_in_dataset=True)
-    
-    overlay_lines = [
-        {'var': 'dive_profile_fit', 'style': {'color': "#23FFFF", 'linewidth': 7.5}}
-    ]
+    overlay_lines = []
+
+    if overlay_line_var is not None:
+        overlay_lines = [
+            {'var': f'{overlay_line_var}_fit', 'style': {'color': "#23FFFF", 'linewidth': 7.5}}
+        ]
 
     echogram.plot_cluster_echogram(
         ds_final, 
@@ -2369,7 +2372,8 @@ def full_dbscan_iteration(
         y_to_x_aspect_ratio_override=None,
         n_quantiles=100,
         soft_membership_threshold=None, 
-        cluster_colors=None
+        cluster_colors=None,
+        overlay_line_var=None
         ):
     
     if cluster_colors is None:
@@ -2439,7 +2443,8 @@ def full_dbscan_iteration(
         find_background_cluster=find_background_cluster,
         y_to_x_aspect_ratio_override=y_to_x_aspect_ratio_override,
         soft_membership_threshold=soft_membership_threshold, 
-        cluster_colors=cluster_colors
+        cluster_colors=cluster_colors,
+        overlay_line_var=overlay_line_var
         )
 
 
