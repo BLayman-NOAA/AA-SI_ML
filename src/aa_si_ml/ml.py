@@ -77,6 +77,53 @@ def add_largest_cluster_mask(ds_Sv, cluster_labels_gridded, use_corrected=True, 
     return ds_with_mask
 
 
+def add_cluster_label_mask(ds_Sv, cluster_labels_gridded, cluster_label, use_corrected=True, mask_name='cluster_mask'):
+    """Create a mask that excludes a specific cluster label from the dataset.
+    
+    Unlike add_largest_cluster_mask which always picks the largest, this lets you
+    specify exactly which cluster label to mask out (e.g. a background cluster
+    identified by retrieve_background_cluster).
+    
+    Parameters
+    ----------
+    ds_Sv : xr.Dataset
+        The dataset to add the mask to.
+    cluster_labels_gridded : xr.DataArray
+        2D gridded cluster labels (ping_time x range_sample).
+    cluster_label : int
+        The specific cluster label to mask out.
+    use_corrected : bool
+        Whether to use Sv_corrected for determining shape.
+    mask_name : str
+        Name for the stored mask variable.
+    
+    Returns
+    -------
+    ds_with_mask : xr.Dataset
+        Dataset with the mask added.
+    """
+    ds_with_mask = ds_Sv
+    sv_var = 'Sv_corrected' if use_corrected and 'Sv_corrected' in ds_Sv else 'Sv'
+    sv_data = ds_Sv[sv_var]
+    valid_mask = xr.ones_like(sv_data, dtype=bool)
+
+    cluster_2d_mask = cluster_labels_gridded == cluster_label
+    cluster_count = int(cluster_2d_mask.sum().values)
+    print(f"Masking cluster {cluster_label} with {cluster_count:,} points")
+
+    cluster_broadcast = cluster_2d_mask.broadcast_like(sv_data)
+    final_mask = valid_mask & ~cluster_broadcast
+
+    n_excluded = final_mask.sum().values
+    print(f"Masked {n_excluded:,} NaN values")
+
+    ds_with_mask[mask_name] = final_mask
+    ds_with_mask[mask_name].attrs['long_name'] = f'Valid data mask excluding cluster {cluster_label}'
+    ds_with_mask[mask_name].attrs['description'] = f'Mask that excludes cluster label {cluster_label}'
+
+    return ds_with_mask
+
+
 def get_grid_coordinates(ds_Sv, data_var):
     """
     Get the coordinates of the data variable.
@@ -2107,6 +2154,48 @@ def plot_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_dat
 
 
 
+def remove_noise(
+        ds_Sv,
+        noise_range_sample_num=10,
+        noise_ping_num=5,
+        assign_to_sv=True
+        ):
+    """Remove background noise from Sv data and align Sv/Sv_corrected variables."""
+
+    ds_Sv_clean = ep.clean.remove_background_noise(
+        ds_Sv,
+        range_sample_num=noise_range_sample_num,
+        ping_num=noise_ping_num,
+    )
+    if assign_to_sv:
+        ds_Sv_clean["Sv"] = ds_Sv_clean["Sv_corrected"]
+
+    return ds_Sv_clean
+
+
+def compute_mvbs(
+        ds_Sv_clean,
+        mvbs_range_bin="2m",
+        mvbs_ping_time_bin="10s",
+        mvbs_nan_threshold=0.9
+        ):
+    """Mask sparse bins and compute MVBS."""
+    if mvbs_nan_threshold is not None:
+        ds_Sv_clean = utils.mask_sparse_bins(
+            ds_Sv_clean,
+            range_bin=mvbs_range_bin,
+            ping_time_bin=mvbs_ping_time_bin,
+            nan_threshold=mvbs_nan_threshold
+        )
+
+    ds_MVBS = ep.commongrid.compute_MVBS(
+        ds_Sv_clean,
+        range_bin=mvbs_range_bin,
+        ping_time_bin=mvbs_ping_time_bin
+    )
+    return ds_Sv_clean, ds_MVBS
+
+
 def data_preprocessing_pipeline(
         ds_Sv, 
         echodata, 
@@ -2122,30 +2211,18 @@ def data_preprocessing_pipeline(
         overlay_line_path=None
         ):
     
-    if remove_background_noise:
-        ds_Sv_clean = ep.clean.remove_background_noise(    
-            ds_Sv,
-            range_sample_num=noise_range_sample_num,  
-            ping_num=noise_ping_num,           
-        )
-        ds_Sv_clean["Sv"] = ds_Sv_clean["Sv_corrected"]
+    ds_Sv_clean = remove_noise(
+        ds_Sv,
+        noise_range_sample_num=noise_range_sample_num,
+        noise_ping_num=noise_ping_num,
+        remove_background_noise=remove_background_noise
+    )
 
-    else:
-        ds_Sv_clean = ds_Sv
-        ds_Sv_clean["Sv_corrected"] = ds_Sv_clean["Sv"]
-        
-
-    range_bin = mvbs_range_bin
-    ping_time_bin = mvbs_ping_time_bin
-    nan_threshold = mvbs_nan_threshold
-    
-    if nan_threshold is not None:
-        ds_Sv_clean = utils.mask_sparse_bins(ds_Sv_clean, range_bin=range_bin, ping_time_bin=ping_time_bin, nan_threshold=nan_threshold)
-
-    ds_MVBS = ep.commongrid.compute_MVBS(
-        ds_Sv_clean,              
-        range_bin=range_bin,  
-        ping_time_bin=ping_time_bin  
+    ds_Sv_clean, ds_MVBS = compute_mvbs(
+        ds_Sv_clean,
+        mvbs_range_bin=mvbs_range_bin,
+        mvbs_ping_time_bin=mvbs_ping_time_bin,
+        mvbs_nan_threshold=mvbs_nan_threshold
     )
 
     overlay_lines = None
@@ -2205,8 +2282,9 @@ def reshape_and_normalize_data(
         normalization_strategy="standard", 
         feature_weights=None,
         plot_window=[0, 1200, 0, 600],
-        exclude_largest_data_name=None,
+        exclude_cluster_data_name=None,
         gridded_results_to_mask=None,
+        mask_cluster_label=None,
         y_to_x_aspect_ratio_override=None,
         n_quantiles=100,
         cluster_colors=None
@@ -2218,12 +2296,16 @@ def reshape_and_normalize_data(
                 "#EDFF4D", "#4E9200", "#970021", "#5600C7", "#017685FF", "#0400FFFF"
             ]
 
-    exclude_largest_mask_name = None
-    # Exclude largest cluster and run second pass
-    if exclude_largest_data_name is not None and gridded_results_to_mask is not None:
-        exclude_largest_mask_name = f'{exclude_largest_data_name}_mask'
+    cluster_mask_name = None
+    # Exclude a specific cluster label (e.g. background cluster from first pass)
+    if mask_cluster_label is not None and gridded_results_to_mask is not None:
+        cluster_mask_name = f'{exclude_cluster_data_name or "cluster"}_mask'
+        ds_Sv = add_cluster_label_mask(ds_Sv, gridded_results_to_mask, mask_cluster_label, mask_name=cluster_mask_name)
+    # Fallback: exclude largest cluster (legacy behavior)
+    elif exclude_cluster_data_name is not None and gridded_results_to_mask is not None:
+        cluster_mask_name = f'{exclude_cluster_data_name}_mask'
         # Create the largest cluster mask
-        ds_Sv = add_largest_cluster_mask(ds_Sv, gridded_results_to_mask, mask_name=exclude_largest_mask_name)
+        ds_Sv = add_largest_cluster_mask(ds_Sv, gridded_results_to_mask, mask_name=cluster_mask_name)
     
 
     ds_ml_ready = reshape_data_for_ml(
@@ -2232,7 +2314,7 @@ def reshape_and_normalize_data(
         dataset_name=custom_dataset_name, 
         feature_strategy=feature_strategy,
         baseline_channel=baseline_channel,
-        custom_data_mask_name=exclude_largest_mask_name
+        custom_data_mask_name=cluster_mask_name
         )
     
     if normalization_strategy is not "none":
@@ -2286,13 +2368,15 @@ def extract_data_and_run_hdbscan(
         y_to_x_aspect_ratio_override=None,
         soft_membership_threshold=None, 
         cluster_colors=None,
-        overlay_line_var=None
+        overlay_line_var=None,
+        cluster_stats_sv_data_var="Sv",
+        cluster_stats_compute_pairwise_differences=True
         ):
 
     X, _, sample_indices = extract_valid_samples_for_sklearn(ds_normalized, custom_normalization_name, dataset_name=custom_dataset_name)
 
     if find_background_cluster:
-        dbscan_results = retrieve_background_cluster(X, sample_indices, min_samples, sample_size, min_cluster_size, cluster_selection_method)
+        dbscan_results, background_label = retrieve_background_cluster(X, sample_indices, min_samples, sample_size, min_cluster_size, cluster_selection_method)
 
     else:
 
@@ -2338,10 +2422,13 @@ def extract_data_and_run_hdbscan(
 
     )
 
-    plot_cluster_statistics(ds_final, ml_result_name, dataset_name=custom_dataset_name, sv_data_var='Sv', compute_pairwise_diffs=True, cluster_colors=cluster_colors)
+    plot_cluster_statistics(ds_final, ml_result_name, dataset_name=custom_dataset_name, cluster_colors=cluster_colors, sv_data_var=cluster_stats_sv_data_var, compute_pairwise_diffs=cluster_stats_compute_pairwise_differences)
 
     if useHDBScan and not find_background_cluster:
         plot_dbscan_cluster_hierarchy(dbscan_results[first_key]["model"], cluster_colors_by_index=cluster_colors)
+
+    if find_background_cluster:
+        return ds_final, gridded_results_dbscan, dbscan_results, background_label
     return ds_final, gridded_results_dbscan, dbscan_results
 
 
@@ -2366,14 +2453,17 @@ def full_dbscan_iteration(
         min_cluster_size=2000,
         cluster_selection_method="leaf",
         useHDBScan=True,
-        exclude_largest_data_name=None,
+        exclude_cluster_data_name=None,
         gridded_results_to_mask=None,
+        mask_cluster_label=None,
         find_background_cluster=False,
         y_to_x_aspect_ratio_override=None,
         n_quantiles=100,
         soft_membership_threshold=None, 
         cluster_colors=None,
-        overlay_line_var=None
+        overlay_line_var=None,
+        cluster_stats_sv_data_var="Sv",
+        cluster_stats_compute_pairwise_differences=True
         ):
     
     if cluster_colors is None:
@@ -2382,12 +2472,15 @@ def full_dbscan_iteration(
                 "#EDFF4D", "#4E9200", "#970021", "#5600C7", "#017685FF", "#0400FFFF"
             ]
 
-    exclude_largest_mask_name = None
-    # Exclude largest cluster and run second pass
-    if exclude_largest_data_name is not None and gridded_results_to_mask is not None:
-        exclude_largest_mask_name = f'{exclude_largest_data_name}_mask'
-        # Create the largest cluster mask
-        ds_Sv = add_largest_cluster_mask(ds_Sv, gridded_results_to_mask, mask_name=exclude_largest_mask_name)
+    cluster_mask_name = None
+    # Exclude a specific cluster label (e.g. background cluster from first pass)
+    if mask_cluster_label is not None and gridded_results_to_mask is not None:
+        cluster_mask_name = f'{exclude_cluster_data_name or "cluster"}_mask'
+        ds_Sv = add_cluster_label_mask(ds_Sv, gridded_results_to_mask, mask_cluster_label, mask_name=cluster_mask_name)
+    # Fallback: exclude largest cluster (legacy behavior)
+    elif exclude_cluster_data_name is not None and gridded_results_to_mask is not None:
+        cluster_mask_name = f'{exclude_cluster_data_name}_mask'
+        ds_Sv = add_largest_cluster_mask(ds_Sv, gridded_results_to_mask, mask_name=cluster_mask_name)
     
 
     ds_ml_ready = reshape_data_for_ml(
@@ -2396,7 +2489,7 @@ def full_dbscan_iteration(
         dataset_name=custom_dataset_name, 
         feature_strategy=feature_strategy,
         baseline_channel=baseline_channel,
-        custom_data_mask_name=exclude_largest_mask_name
+        custom_data_mask_name=cluster_mask_name
         )
     
     if normalization_strategy is not "none":
@@ -2444,13 +2537,32 @@ def full_dbscan_iteration(
         y_to_x_aspect_ratio_override=y_to_x_aspect_ratio_override,
         soft_membership_threshold=soft_membership_threshold, 
         cluster_colors=cluster_colors,
-        overlay_line_var=overlay_line_var
+        overlay_line_var=overlay_line_var,
+        cluster_stats_sv_data_var=cluster_stats_sv_data_var,
+        cluster_stats_compute_pairwise_differences=cluster_stats_compute_pairwise_differences
         )
 
 
 
 
-def retrieve_background_cluster(X, sample_indices, min_samples, sample_size, min_cluster_size, cluster_selection_method):
+def retrieve_background_cluster(X, sample_indices, min_samples, sample_size, min_cluster_size, cluster_selection_method,
+                                feature_threshold=-0.2, min_fraction=0.1):
+    """Find a background cluster by iterating over epsilon values and checking all clusters.
+    
+    Returns the dbscan_results and the label of the identified background cluster.
+    A cluster qualifies as background if:
+      1. Its average feature[0] is below `feature_threshold` (default: -0.2)
+      2. It contains more than `min_fraction` (default: 10%) of total labeled samples
+    
+    Among qualifying clusters, the largest one is selected.
+    
+    Returns
+    -------
+    dbscan_results : dict
+        The clustering results dict from apply_dbscan_clustering.
+    background_label : int
+        The cluster label identified as background.
+    """
     for epsilon in [0.05, .06, .07, .08, .09, .1, .2, .3, .4, .5]:
         print(f"Trying to find background cluster with eps={epsilon}")  
         dbscan_results = apply_dbscan_clustering(
@@ -2467,30 +2579,42 @@ def retrieve_background_cluster(X, sample_indices, min_samples, sample_size, min
                 cluster_selection_method=cluster_selection_method
             )
         
-        # If one or more cluster is found (not all noise), take the largest cluster, check that it's feature at index 0 has an average value below -90 dB, 
-        # and if so, break out of the loop and return the results
         first_key = next(iter(dbscan_results))
         labels = dbscan_results[first_key]["labels"]
-        used_sample_indices = dbscan_results[first_key]["sample_indices"]  # Indices of the subsample in the full X
+        used_sample_indices = dbscan_results[first_key]["sample_indices"]
         unique_labels, counts = np.unique(labels, return_counts=True)
         valid_mask = unique_labels >= 0
         valid_labels = unique_labels[valid_mask]
         valid_counts = counts[valid_mask]
-        if len(valid_labels) > 0:
-            # Find largest cluster
-            largest_idx = np.argmax(valid_counts)
-            largest_label = valid_labels[largest_idx]
-            largest_mask = labels == largest_label
-            # Reconstruct the subsampled X for accurate averaging (matches labels shape)
-            X_sample = X[used_sample_indices]
-            # Check average value of feature at index 0
-            avg_feature0 = np.mean(X_sample[largest_mask, 0])
-            print(f"Largest cluster {largest_label}: avg feature[0] = {avg_feature0:.2f}")
-            if avg_feature0 < -.2:
-                print(f"Found background cluster with avg feature[0] < -.2 at eps={epsilon}")
-                return dbscan_results
 
-    raise ValueError("Could not find background cluster with avg feature[0] < -.2")
+        if len(valid_labels) == 0:
+            continue
+
+        total_samples = len(labels)
+        X_sample = X[used_sample_indices]
+
+        # Iterate over all clusters and collect qualifying background candidates
+        candidates = []  # list of (label, count, avg_feature0)
+        for i, label in enumerate(valid_labels):
+            count = valid_counts[i]
+            fraction = count / total_samples
+            cluster_mask = labels == label
+            avg_feature0 = np.mean(X_sample[cluster_mask, 0])
+            print(f"  Cluster {label}: avg feature[0] = {avg_feature0:.2f}, "
+                  f"size = {count:,} ({fraction:.1%} of total)")
+            if avg_feature0 < feature_threshold and fraction > min_fraction:
+                candidates.append((label, count, avg_feature0))
+
+        if candidates:
+            # Pick the largest qualifying candidate
+            best = max(candidates, key=lambda c: c[1])
+            background_label = best[0]
+            print(f"Found background cluster {background_label} with avg feature[0] = {best[2]:.2f}, "
+                  f"size = {best[1]:,} at eps={epsilon}")
+            return dbscan_results, background_label
+
+    raise ValueError(f"Could not find background cluster with avg feature[0] < {feature_threshold} "
+                     f"and > {min_fraction:.0%} of total samples")
 
 
 def plot_dbscan_cluster_hierarchy(model, cluster_colors_by_index=None):
