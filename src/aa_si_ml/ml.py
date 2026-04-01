@@ -1,38 +1,52 @@
+import time
+
 import numpy as np
-import xarray as xr 
-from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler, Normalizer, PowerTransformer, QuantileTransformer
-import hdbscan
-from sklearn.cluster import KMeans, DBSCAN, HDBSCAN
-from sklearn.metrics import silhouette_score
-from scipy.stats import norm
-from aa_si_visualization import echogram
-from aa_si_utils import utils
-import echopype as ep 
-# Create legend with feature names
+import xarray as xr
+import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 from matplotlib.lines import Line2D
-import matplotlib.pyplot as plt
+from sklearn.preprocessing import (
+    StandardScaler, RobustScaler, MinMaxScaler,
+    Normalizer, PowerTransformer, QuantileTransformer,
+)
+from sklearn.cluster import KMeans, DBSCAN
+from sklearn.metrics import silhouette_score
+from scipy.stats import norm
+import hdbscan
 import umap
+import echopype as ep
+from aa_si_visualization import echogram
+from aa_si_utils import utils
 
 
 
 def add_largest_cluster_mask(ds_Sv, cluster_labels_gridded, use_corrected=True, mask_name='largest_cluster_mask'):
+    """Create a mask that excludes the largest cluster from the dataset.
+
+    Identifies the cluster with the most points (ignoring noise label -1)
+    and produces a boolean mask where those points are ``False``.
+
+    Args:
+        ds_Sv (xr.Dataset): Dataset containing Sv data.
+        cluster_labels_gridded (xr.DataArray): 2-D gridded cluster labels
+            (ping_time x range_sample).
+        use_corrected (bool): Use ``Sv_corrected`` when available.
+            Defaults to True.
+        mask_name (str): Name for the stored mask variable.
+            Defaults to 'largest_cluster_mask'.
+
+    Returns:
+        xr.Dataset: Input dataset with the mask added as a new variable.
+    """
     ds_with_mask = ds_Sv
 
-    # Choose which Sv variable to use for analysis
     sv_var = 'Sv_corrected' if use_corrected and 'Sv_corrected' in ds_Sv else 'Sv'
-
-    # Get reference to the Sv data for analysis
     sv_data = ds_Sv[sv_var]
-    
-    # Create validity mask starting with all True
+
     valid_mask = xr.ones_like(sv_data, dtype=bool)
 
-    # Step 1: identify the largest cluster label in cluster_labels_gridded
-    # Get unique labels and their counts (excluding noise points labeled as -1)
     unique_labels, counts = np.unique(cluster_labels_gridded, return_counts=True)
-    
-    # Filter out noise points (-1) and invalid values
+
     valid_label_mask = unique_labels >= 0
     valid_labels = unique_labels[valid_label_mask]
     valid_counts = counts[valid_label_mask]
@@ -49,29 +63,19 @@ def add_largest_cluster_mask(ds_Sv, cluster_labels_gridded, use_corrected=True, 
     
     print(f"Largest cluster: label {largest_cluster_label} with {largest_cluster_size:,} points")
 
-    # Step 2: create and apply the 2D mask of the largest cluster to all channels in sv_data
     if largest_cluster_label >= 0:
-        # Create 2D mask where largest cluster points are True
         largest_cluster_2d_mask = cluster_labels_gridded == largest_cluster_label
-        
-        # Broadcast the 2D mask to 3D to match sv_data dimensions (channel, ping_time, range_sample)
-        # We need to add the channel dimension and broadcast
         largest_cluster_mask = largest_cluster_2d_mask.broadcast_like(sv_data)
         largest_cluster_mask = valid_mask & ~largest_cluster_mask
-    
     else:
-        # If no valid clusters, create an all-False mask
         largest_cluster_mask = xr.zeros_like(sv_data, dtype=bool)
 
     n_excluded = largest_cluster_mask.sum().values
-    print(f"Masked {n_excluded:,} NaN values")
-    
-    # Store the validity mask 
-    ds_with_mask[mask_name] = largest_cluster_mask
+    print(f"Masked {n_excluded:,} values")
 
-    # Add metadata
+    ds_with_mask[mask_name] = largest_cluster_mask
     ds_with_mask[mask_name].attrs['long_name'] = 'Valid data mask of largest cluster'
-    ds_with_mask[mask_name].attrs['description'] = 'Creates a mask of all data points in the largest cluster'
+    ds_with_mask[mask_name].attrs['description'] = 'Mask excluding all data points in the largest cluster'
     ds_with_mask[mask_name].attrs['source_variable'] = cluster_labels_gridded
 
     return ds_with_mask
@@ -79,28 +83,23 @@ def add_largest_cluster_mask(ds_Sv, cluster_labels_gridded, use_corrected=True, 
 
 def add_cluster_label_mask(ds_Sv, cluster_labels_gridded, cluster_label, use_corrected=True, mask_name='cluster_mask'):
     """Create a mask that excludes a specific cluster label from the dataset.
-    
-    Unlike add_largest_cluster_mask which always picks the largest, this lets you
-    specify exactly which cluster label to mask out (e.g. a background cluster
-    identified by retrieve_background_cluster).
-    
-    Parameters
-    ----------
-    ds_Sv : xr.Dataset
-        The dataset to add the mask to.
-    cluster_labels_gridded : xr.DataArray
-        2D gridded cluster labels (ping_time x range_sample).
-    cluster_label : int
-        The specific cluster label to mask out.
-    use_corrected : bool
-        Whether to use Sv_corrected for determining shape.
-    mask_name : str
-        Name for the stored mask variable.
-    
-    Returns
-    -------
-    ds_with_mask : xr.Dataset
-        Dataset with the mask added.
+
+    Unlike ``add_largest_cluster_mask`` which always picks the largest, this
+    lets you specify exactly which cluster label to mask out (e.g. a background
+    cluster identified by ``retrieve_background_cluster``).
+
+    Args:
+        ds_Sv (xr.Dataset): The dataset to add the mask to.
+        cluster_labels_gridded (xr.DataArray): 2-D gridded cluster labels
+            (ping_time x range_sample).
+        cluster_label (int): The specific cluster label to mask out.
+        use_corrected (bool): Use ``Sv_corrected`` for determining shape.
+            Defaults to True.
+        mask_name (str): Name for the stored mask variable.
+            Defaults to 'cluster_mask'.
+
+    Returns:
+        xr.Dataset: Dataset with the mask added.
     """
     ds_with_mask = ds_Sv
     sv_var = 'Sv_corrected' if use_corrected and 'Sv_corrected' in ds_Sv else 'Sv'
@@ -125,18 +124,20 @@ def add_cluster_label_mask(ds_Sv, cluster_labels_gridded, cluster_label, use_cor
 
 
 def get_grid_coordinates(ds_Sv, data_var):
-    """
-    Get the coordinates of the data variable.
-    
-    Parameters:
-    -----------
-    data_var : xarray.DataArray
-        The data variable to inspect.
-        
+    """Return the two spatial dimension names for a data variable.
+
+    Finds the non-channel, non-feature dimensions of ``data_var`` and
+    returns them in ``(time-like, range-like)`` order.
+
+    Args:
+        ds_Sv (xr.Dataset): Dataset containing the data variable.
+        data_var (str): Name of the data variable to inspect.
+
     Returns:
-    --------
-    coords : list
-        List of coordinate names.
+        list[str]: Two-element list of spatial coordinate names.
+
+    Raises:
+        ValueError: If the number of spatial coordinates is not exactly 2.
     """
     
     # Get the actual dimensions of the data variable (not all associated coordinates)
@@ -164,54 +165,47 @@ def get_grid_coordinates(ds_Sv, data_var):
 
 # called by reshape_data_for_ml
 def add_valid_data_mask(ds_Sv, remove_nan=True, mask_invalid_values=True, mask_name='valid_mask', custom_mask_name=None, data_var='Sv'):
-    """
-    Add a validity mask to identify clean data points suitable for machine learning.
-    
-    This function creates a boolean mask indicating which data points are valid
-    for ML analysis without duplicating the actual data.
-    
-    Parameters:
-    -----------
-    ds_Sv : xarray.Dataset
-        Sv dataset (regular or with noise correction applied)
-    remove_nan : bool
-        Whether to mask NaN values (default: True)
-    mask_invalid_values : bool
-        Whether to mask extremely low/high values that might be artifacts (default: True)
-        
+    """Add a boolean validity mask identifying clean data points for ML.
+
+    Creates a per-element mask over the Sv data, marking points that are
+    free of NaNs, extreme artifacts, and (optionally) a user-supplied mask.
+
+    Args:
+        ds_Sv (xr.Dataset): Dataset containing acoustic backscatter data.
+        remove_nan (bool): Mask NaN values. Defaults to True.
+        mask_invalid_values (bool): Mask extreme values outside [-200, 50] dB.
+            Defaults to True.
+        mask_name (str): Name for the stored mask variable.
+            Defaults to 'valid_mask'.
+        custom_mask_name (str or None): Name of an existing boolean variable
+            in *ds_Sv* to combine with the computed mask. Defaults to None.
+        data_var (str): Name of the Sv variable to analyse.
+            Defaults to 'Sv'.
+
     Returns:
-    --------
-    ds_Sv_with_mask : xarray.Dataset
-        Same dataset with additional data variable:
-        - 'valid_mask': boolean mask indicating which points are valid for ML
+        xr.Dataset: Input dataset with the boolean mask added.
     """
     
     ds_with_mask = ds_Sv
-    
-    # Choose which Sv variable to use for analysis
+
     sv_var = data_var
     print(f"Analyzing '{sv_var}' for validity")
     print(f"Data shape: {ds_Sv[sv_var].shape}")
     print(f"Channels (frequencies): {len(ds_Sv['channel'])}")
-    
-    # Get reference to the Sv data for analysis
+
     sv_data = ds_Sv[sv_var]
-    
-    # Create validity mask starting with all True
     valid_mask = xr.ones_like(sv_data, dtype=bool)
-    
-    # 1. Remove NaN values
+
     if remove_nan:
         nan_mask = xr.ufuncs.isnan(sv_data)
         valid_mask = valid_mask & ~nan_mask
         n_nan = nan_mask.sum().values
         print(f"Masked {n_nan:,} NaN values")
-    
-    # 2. Remove invalid/extreme values that are likely artifacts
+
     if mask_invalid_values:
-        # Typical Sv range is roughly -120 to 20 dB, but we'll be conservative
-        too_low_mask = sv_data < -200  # Extremely low values
-        too_high_mask = sv_data > 50   # Extremely high values
+        # Typical Sv range is roughly -120 to 20 dB; use conservative bounds
+        too_low_mask = sv_data < -200
+        too_high_mask = sv_data > 50
         artifact_mask = too_low_mask | too_high_mask
         valid_mask = valid_mask & ~artifact_mask
         n_artifacts = artifact_mask.sum().values
@@ -225,10 +219,7 @@ def add_valid_data_mask(ds_Sv, remove_nan=True, mask_invalid_values=True, mask_n
         n_custom_masked = (~custom_mask).sum().values
         print(f"Applied custom mask, masking additional {n_custom_masked:,} values")
     
-    # Store the validity mask 
     ds_with_mask[mask_name] = valid_mask
-
-    # Add metadata
     ds_with_mask[mask_name].attrs['long_name'] = 'Valid data mask for machine learning'
     ds_with_mask[mask_name].attrs['description'] = 'True where data is valid for ML analysis'
     ds_with_mask[mask_name].attrs['source_variable'] = sv_var
@@ -238,44 +229,36 @@ def add_valid_data_mask(ds_Sv, remove_nan=True, mask_invalid_values=True, mask_n
 
 # called by reshape_data_for_ml
 def create_ml_index_coordinate(ds_with_mask, data_var='Sv', dataset_name='ml_data_clean'):
-    """
-    Create a unique grid index for every data point in the grid.
-    
-    This creates a persistent coordinate that tracks individual data points
-    through all ML transformations, allowing efficient storage and regridding.
-    
-    Parameters:
-    -----------
-    ds_with_mask : xarray.Dataset
-        Dataset with valid_mask
-        
+    """Assign a unique integer index to every grid cell.
+
+    The index is stored as a 2-D coordinate and is used to track
+    individual data points through flattening, ML, and regridding.
+
+    Args:
+        ds_with_mask (xr.Dataset): Dataset with a valid-data mask.
+        data_var (str): Name of the Sv variable whose grid shape to use.
+            Defaults to 'Sv'.
+        dataset_name (str): Base name used for coordinate naming.
+            Defaults to 'ml_data_clean'.
+
     Returns:
-    --------
-    ds_with_index : xarray.Dataset
-        Dataset with additional 'grid_index' coordinate and lookup arrays
+        xr.Dataset: Dataset with a ``grid_index`` coordinate added.
     """
     ds_with_index = ds_with_mask
-
     grid_coords = get_grid_coordinates(ds_with_mask, data_var)
+    print(f"Creating grid index coordinate based on {grid_coords}...")
 
-    
-    print(f"Creating unique grid index coordinate based on {grid_coords}...")
-
-    # Create unique index for every grid point
     coord_1_size = ds_with_mask.sizes[grid_coords[0]]
     coord_2_size = ds_with_mask.sizes[grid_coords[1]]
     total_points = coord_1_size * coord_2_size
-    
-    # Create 2D grid of indices
     grid_index_grid = np.arange(total_points).reshape(coord_1_size, coord_2_size)
-    
-    # Determine coordinate name - append dataset_name if not standard coordinates
+
     if grid_coords[0] == 'ping_time' and grid_coords[1] == 'range_sample':
         grid_index_name = 'grid_index'
     else:
         grid_index_name = f'grid_index_{dataset_name}'
 
-    # Store as coordinate with actual dimension names
+    # Store as coordinate
     ds_with_index.coords[grid_index_name] = ((grid_coords[0], grid_coords[1]), grid_index_grid)
     ds_with_index[grid_index_name].attrs['long_name'] = 'Grid data point index'
     ds_with_index[grid_index_name].attrs['description'] = f'Unique index for each grid point (dims: {grid_coords[0]}, {grid_coords[1]}), preserved in ML operations'
@@ -291,39 +274,38 @@ def create_ml_index_coordinate(ds_with_mask, data_var='Sv', dataset_name='ml_dat
 def extract_ml_data_flattened(ds_ml_ready, data_var='Sv', mask_name='valid_mask', 
                             dataset_name='ml_data_clean', feature_strategy='channels', 
                             baseline_channel=2, **feature_kwargs):
-    """
-    Extract valid ML data in efficient flattened format with configurable feature extraction.
-    
-    Parameters:
-    -----------
-    ds_ml_ready : xarray.Dataset
-        Dataset with grid_index coordinate and valid_mask
-    data_var : str
-        Name of the data variable to extract
-    mask_name : str
-        Name of the valid mask to use
-    dataset_name : str
-        Base name for the dataset to create data-specific coordinate names
-    feature_strategy : str
-        Feature extraction strategy:
-        - 'channels': Use raw channel data (current behavior)
-        - 'baseline_plus_differences': Use baseline + differences from baseline
-        - 'mean_centered': Include mean Sv plus per-sample centered channels.
-          Captures both intensity (via mean) and spectral shape (via centered values).
-          Features: [mean_Sv, centered_ch1, centered_ch2, ...]. Recommended for
-          multi-frequency Sv data when you want baseline-agnostic intensity encoding.
-        - 'custom': User-provided feature extraction function
-    baseline_channel : int
-        Channel index to use as baseline for difference calculations (default: 2 for ~120kHz)
-    **feature_kwargs : dict
-        Additional arguments for feature extraction strategies
-        
+    """Extract valid data points into a flat array with configurable features.
+
+    Reads the validity mask, selects points valid across all channels,
+    and constructs a 2-D ``(sample, feature)`` array ready for ML.
+
+    Args:
+        ds_ml_ready (xr.Dataset): Dataset with ``grid_index`` coordinate and
+            a valid-data mask.
+        data_var (str): Name of the Sv variable to extract. Defaults to 'Sv'.
+        mask_name (str): Name of the boolean mask variable.
+            Defaults to 'valid_mask'.
+        dataset_name (str): Base name used for coordinate naming.
+            Defaults to 'ml_data_clean'.
+        feature_strategy (str): How to construct features from channels.
+            ``'channels'`` -- raw channel values (default).
+            ``'baseline_plus_differences'`` -- one baseline channel plus
+            differences of the remaining channels from the baseline.
+            ``'mean_centered'`` -- per-sample mean Sv plus each channel
+            centred around that mean (captures intensity and spectral shape).
+            ``'custom'`` -- user-provided function via *feature_kwargs*.
+        baseline_channel (int): Channel index used as the baseline when
+            *feature_strategy* is ``'baseline_plus_differences'``.
+            Defaults to 2.
+        **feature_kwargs: Extra arguments forwarded to a ``'custom'`` feature
+            function.
+
     Returns:
-    --------
-    ml_data_flat : xarray.DataArray
-        Flattened valid data with sample_index dimension
-    grid_indices : numpy.ndarray
-        Grid indices corresponding to each sample
+        tuple: A tuple of (ml_data_flat, grid_indices) where:
+            ml_data_flat (xr.DataArray): Flattened data with shape
+            ``(n_samples, n_features)``.
+            grid_indices (np.ndarray): Grid index for each sample, used to
+            map results back to the original grid.
     """
 
     data = ds_ml_ready[data_var]
@@ -338,47 +320,33 @@ def extract_ml_data_flattened(ds_ml_ready, data_var='Sv', mask_name='valid_mask'
 
     if grid_index_name not in ds_ml_ready.coords:
         raise ValueError(f"Dataset must have '{grid_index_name}' coordinate. Run create_ml_index_coordinate() first.")
-    
 
     grid_index_grid = ds_ml_ready[grid_index_name]
 
-    # Find points valid across all channels
     valid_samples = valid_mask.all(dim='channel')
-    
-    # Get valid indices
     ping_indices, range_indices = np.where(valid_samples.values)
-    
-    # Extract raw data at valid points
+
     raw_data_values = data.values[:, ping_indices, range_indices].T  # (n_samples, n_channels)
     grid_indices = grid_index_grid.values[ping_indices, range_indices]
-    
-    # Apply feature extraction strategy
+
     if feature_strategy == 'channels':
-        # Current behavior - use raw channels
         feature_data = raw_data_values
         feature_coords = data.coords['channel']
         feature_dim_name = 'channel'
-        
+
     elif feature_strategy == 'baseline_plus_differences':
-        # New: baseline + differences (excluding baseline from differences)
         if baseline_channel >= raw_data_values.shape[1]:
             raise ValueError(f"baseline_channel {baseline_channel} exceeds number of channels {raw_data_values.shape[1]}")
             
-        baseline_values = raw_data_values[:, baseline_channel:baseline_channel+1]  # Keep as 2D
-        
-        # Get indices for all other channels (excluding baseline)
+        baseline_values = raw_data_values[:, baseline_channel:baseline_channel+1]
         other_channels = [i for i in range(raw_data_values.shape[1]) if i != baseline_channel]
-        
-        # Calculate differences: other_frequencies - baseline
         difference_values = raw_data_values[:, other_channels] - baseline_values
         
-        # Combine baseline + differences
         feature_data = np.concatenate([
-            baseline_values,  # Baseline frequency Sv
-            difference_values  # Differences (other_freq - baseline)
+            baseline_values,
+            difference_values
         ], axis=1)
-        
-        # Create feature coordinate names
+
         baseline_name = f"baseline_{data.coords['channel'].values[baseline_channel]}"
         diff_names = [f"diff_{data.coords['channel'].values[i]}_minus_{data.coords['channel'].values[baseline_channel]}" 
                      for i in other_channels]
@@ -386,23 +354,14 @@ def extract_ml_data_flattened(ds_ml_ready, data_var='Sv', mask_name='valid_mask'
         feature_dim_name = f'feature_{dataset_name}'
 
     elif feature_strategy == 'mean_centered':
-        # Mean-centered differences: [mean, x[i] - mean(x)] for each sample
-        # Captures both intensity (via mean) and spectral shape (via centered values)
-        # Mean acts as baseline-agnostic intensity measure
-        
-        # Calculate per-sample mean across channels
-        sample_means = np.mean(raw_data_values, axis=1, keepdims=True)  # (n_samples, 1)
-        
-        # Center each channel by subtracting the sample mean
-        centered_values = raw_data_values - sample_means  # (n_samples, n_channels)
-        
-        # Combine mean + centered values (mean provides intensity, centered provides shape)
+        sample_means = np.mean(raw_data_values, axis=1, keepdims=True)
+        centered_values = raw_data_values - sample_means
+
         feature_data = np.concatenate([
-            sample_means,      # Mean Sv (intensity proxy)
-            centered_values    # Deviations from mean (spectral shape)
+            sample_means,
+            centered_values
         ], axis=1)
-        
-        # Create feature coordinate names
+
         channel_names = data.coords['channel'].values
         feature_coords = np.array(
             ["mean_Sv"] + [f"centered_{ch}" for ch in channel_names], 
@@ -411,22 +370,20 @@ def extract_ml_data_flattened(ds_ml_ready, data_var='Sv', mask_name='valid_mask'
         feature_dim_name = f'feature_{dataset_name}'
         
     elif feature_strategy == 'custom':
-        # User-provided feature extraction
         feature_function = feature_kwargs.get('feature_function')
         if feature_function is None:
             raise ValueError("feature_function must be provided for custom strategy")
         feature_data, feature_coords = feature_function(raw_data_values, data.coords['channel'])
-        feature_dim_name = feature_kwargs.get('feature_dim_name', feature_dim_name = f'feature_{dataset_name}')
+        feature_dim_name = feature_kwargs.get('feature_dim_name', f'feature_{dataset_name}')
         
     else:
         raise ValueError(f"Unknown feature_strategy: {feature_strategy}")
-    
-    # Create new dimension for ML samples with data-specific name
+
     n_samples = len(ping_indices)
     sample_index_coord_name = f'{dataset_name}_sample_index'
     sample_index_coord = np.arange(n_samples)
     
-    # Create the flattened DataArray with correct dimensions
+    # Create the flattened DataArray
     ml_data_flat = xr.DataArray(
         feature_data,
         dims=[sample_index_coord_name, feature_dim_name],
@@ -440,7 +397,7 @@ def extract_ml_data_flattened(ds_ml_ready, data_var='Sv', mask_name='valid_mask'
     ml_data_flat.attrs['description'] = f'Valid data in efficient flattened format using {feature_strategy} features'
     ml_data_flat.attrs['source_variable'] = data_var
     ml_data_flat.attrs['feature_strategy'] = feature_strategy
-    ml_data_flat.attrs['grid_name'] = grid_index_name 
+    ml_data_flat.attrs['grid_name'] = grid_index_name
     if feature_strategy == 'baseline_plus_differences':
         ml_data_flat.attrs['baseline_channel'] = baseline_channel
         ml_data_flat.attrs['baseline_frequency'] = str(data.coords['channel'].values[baseline_channel])
@@ -459,105 +416,75 @@ def extract_ml_data_flattened(ds_ml_ready, data_var='Sv', mask_name='valid_mask'
 
 # called by reshape_data_for_ml and normalize_data
 def store_ml_data_flattened(ds_ml_ready, ml_data_flat, grid_indices, dataset_name):
-    """
-    Store flattened ML data with universal index mapping (eliminates redundant index arrays).
-    """
-    # Store the flattened data
-    print(f"\n DEBUG store_ml_data_flattened:")
-    print(f"  dataset_name: '{dataset_name}'")
-    print(f"  ml_data_flat shape: {ml_data_flat.shape}")
-    print(f"  ml_data_flat dims: {ml_data_flat.dims}")
-    print(f"  NaNs in ml_data_flat INPUT: {np.sum(np.isnan(ml_data_flat.values))}")
-    print(f"  ml_data_flat range: {np.nanmin(ml_data_flat.values):.2f} to {np.nanmax(ml_data_flat.values):.2f}")
-    print(f"  feature_dim_name: '{ml_data_flat.dims[1]}'")
-    print(f"  feature_coords type: {type(ml_data_flat.coords[ml_data_flat.dims[1]])}")
-    print(f"  feature_coords values: {ml_data_flat.coords[ml_data_flat.dims[1]].values}")
-    print(f"  feature_coords dtype: {ml_data_flat.coords[ml_data_flat.dims[1]].dtype}")
+    """Store flattened ML data in the dataset with a universal index mapping.
 
-    # Check for existing 'feature' dimension    
-    if f'feature_{dataset_name}' in ds_ml_ready.dims:
-        print(f"\n WARNING: 'feature_{dataset_name}' dimension already exists in dataset!")
-        print(f"   Existing feature coords: {ds_ml_ready.coords[f'feature_{dataset_name}'].values}")
-        print(f"   New feature coords: {ml_data_flat.coords[f'feature_{dataset_name}'].values}")
-        # This will cause coordinate alignment issues!
+    Adds the flattened data array and a ``sample_index -> grid_index``
+    mapping variable so that results can later be regridded.
 
-    # Store the flattened data
+    Args:
+        ds_ml_ready (xr.Dataset): Dataset to store data in.
+        ml_data_flat (xr.DataArray): Flattened data with
+            ``(sample_index, feature)`` dimensions.
+        grid_indices (np.ndarray): Grid index for each sample.
+        dataset_name (str): Base name used for variable/coordinate naming.
+
+    Returns:
+        xr.Dataset: Dataset with the flattened data and mapping added.
+    """
     ds_ml_ready[dataset_name] = ml_data_flat
-    
-    #  CRITICAL: Verify what was actually stored
-    print(f"\n   VERIFICATION after storing:")
-    print(f"  Stored data NaNs: {np.sum(np.isnan(ds_ml_ready[dataset_name].values))}")
-    print(f"  Stored data range: {np.nanmin(ds_ml_ready[dataset_name].values):.2f} to {np.nanmax(ds_ml_ready[dataset_name].values):.2f}")
-    print(f"  Stored data shape: {ds_ml_ready[dataset_name].shape}")
-    print(f"  Stored data dims: {ds_ml_ready[dataset_name].dims}")
-    print(f"  Coordinate names: {list(ds_ml_ready[dataset_name].coords.keys())}")
-    
-    
-    # Create data-specific mapping name
+
     mapping_name = f'{dataset_name}_sample_index_to_grid_index'
     sample_index_coord_name = f'{dataset_name}_sample_index'
-    
-    # Store universal mapping only if it doesn't exist yet
+
     if mapping_name not in ds_ml_ready:
         ds_ml_ready[mapping_name] = xr.DataArray(
             grid_indices,
             dims=[sample_index_coord_name]
-            # Note: don't need this coordinate because the indices are a direct mapping
-            # coords={sample_index_coord_name: ml_data_flat.coords[sample_index_coord_name]}
         )
-        ds_ml_ready[mapping_name].attrs['long_name'] = f'Universal sample index to grid index mapping for {dataset_name}'
-        ds_ml_ready[mapping_name].attrs['description'] = f'Maps {sample_index_coord_name} coordinate to original grid grid_index'
-        print(f"Created universal {mapping_name} mapping with {len(grid_indices)} samples")
+        ds_ml_ready[mapping_name].attrs['long_name'] = f'Sample-index to grid-index mapping for {dataset_name}'
+        ds_ml_ready[mapping_name].attrs['description'] = f'Maps {sample_index_coord_name} to original grid_index'
+        print(f"Created {mapping_name} mapping with {len(grid_indices)} samples")
     else:
-        # Verify consistency (safety check)
         existing_mapping = ds_ml_ready[mapping_name].values
         if not np.array_equal(existing_mapping, grid_indices):
-            raise ValueError(f"Grid indices don't match existing universal mapping for {dataset_name}!");
-        print(f"Using existing universal {mapping_name} mapping")
-    
-    print(f"Stored {dataset_name} in efficient flattened format (using universal mapping)")
+            raise ValueError(f"Grid indices don't match existing mapping for {dataset_name}")
+        print(f"Using existing {mapping_name} mapping")
+
+    print(f"Stored {dataset_name} in flattened format")
     
     return ds_ml_ready
 
 
-# Update reshape_data_for_ml to use v2
 def reshape_data_for_ml(ds_Sv, data_var='Sv_corrected', dataset_name='ml_data_clean',
                           remove_nan=True, mask_invalid_values=True, custom_data_mask_name=None,
                           feature_strategy='channels', baseline_channel=0, **feature_kwargs):
-    """
-    Creates flattened, cleaned, ML-ready data using validity mask and index tracking.
-    
-    Parameters:
-    -----------
-    ds_Sv : xarray.Dataset
-        Sv dataset (regular or with noise correction applied)
-    data_var : str
-        Name of the data variable to use (default: 'Sv_corrected')
-    dataset_name : str
-        Base name for storing ML data variables (default: 'ml_data_clean')
-    remove_nan : bool
-        Whether to mask NaN values when creating validity mask (default: True)
-        Ignored if custom_data_mask is provided
-    mask_invalid_values : bool
-        Whether to mask extremely low/high values that might be artifacts (default: True)
-        Ignored if custom_data_mask is provided
-    custom_data_mask : xarray.DataArray, optional
-        Pre-computed validity mask to use instead of creating one automatically.
-        Must have same dimensions as Sv data and boolean dtype. If provided,
-        remove_nan and mask_invalid_values parameters are ignored (default: None)
-    feature_strategy : str
-        Feature extraction strategy (default: 'channels')
-    baseline_channel : int
-        Channel index for baseline in difference calculations (default: 0)
-    **feature_kwargs : dict
-        Additional arguments for feature extraction
-            
+    """Prepare an xarray Dataset for ML by masking, indexing, and flattening.
+
+    Orchestrates validity masking, grid-index creation, and feature
+    extraction into a single call.  Channels that are entirely NaN are
+    automatically dropped.
+
+    Args:
+        ds_Sv (xr.Dataset): Dataset containing acoustic backscatter data.
+        data_var (str): Sv variable to use. Defaults to 'Sv_corrected'.
+        dataset_name (str): Base name for stored ML variables.
+            Defaults to 'ml_data_clean'.
+        remove_nan (bool): Mask NaN values. Defaults to True.
+        mask_invalid_values (bool): Mask extreme artifact values.
+            Defaults to True.
+        custom_data_mask_name (str or None): Name of a pre-computed mask
+            already present in *ds_Sv* to combine with the auto-generated
+            mask. Defaults to None.
+        feature_strategy (str): Feature extraction strategy forwarded to
+            ``extract_ml_data_flattened``. Defaults to 'channels'.
+        baseline_channel (int): Channel index for baseline difference
+            features. Defaults to 0.
+        **feature_kwargs: Extra arguments for feature extraction.
+
     Returns:
-    --------
-    ds_ml_ready : xarray.Dataset
-        Dataset with ML-ready data, validity mask, and index mapping
+        xr.Dataset: Dataset with flattened ML data, validity mask, and
+        index mapping.
     """
-    # Same logic as before until storage...
 
     mask_name = f"{dataset_name}_valid_mask"
     if custom_data_mask_name is not None:
@@ -570,13 +497,10 @@ def reshape_data_for_ml(ds_Sv, data_var='Sv_corrected', dataset_name='ml_data_cl
 
     ds_with_mask = ds_Sv
     sv_var = data_var
-
     data = ds_Sv[data_var]
-
 
     channels_to_keep = []
     channels_all_nan = []
-    
     
     for i, channel in enumerate(data.coords['channel'].values):
         channel_data = data.isel(channel=i)
@@ -604,20 +528,16 @@ def reshape_data_for_ml(ds_Sv, data_var='Sv_corrected', dataset_name='ml_data_cl
 
     if data.dims[0] != 'channel':
         print(f"Reordering dimensions from {data.dims} to channel-first...")
-        # Transpose to put channel first, then spatial dimensions
         spatial_dims = [dim for dim in data.dims if dim != 'channel']
         desired_order = ['channel'] + spatial_dims
         data = data.transpose(*desired_order)
         print(f"New dimension order: {data.dims}")
-        
-        # Create a modified dataset for processing (don't modify original)
         ds_working = ds_Sv.copy()
         ds_working[data_var] = data
     else:
-        print(f"Dimensions already in correct order: {data.dims}")
         ds_working = ds_Sv
 
-    ds_Sv = ds_working  
+    ds_Sv = ds_working
 
     ds_with_mask = add_valid_data_mask(ds_Sv,
                                     remove_nan=remove_nan,
@@ -627,8 +547,7 @@ def reshape_data_for_ml(ds_Sv, data_var='Sv_corrected', dataset_name='ml_data_cl
                                     data_var=sv_var)
     
     ds_ml_ready = create_ml_index_coordinate(ds_with_mask, data_var=sv_var, dataset_name=dataset_name)
-    
-    
+
     print(f"Preparing ML data from '{sv_var}' as '{dataset_name}'...")
     print(f"Data shape: {ds_ml_ready[sv_var].shape}")
     
@@ -639,8 +558,7 @@ def reshape_data_for_ml(ds_Sv, data_var='Sv_corrected', dataset_name='ml_data_cl
     )
     ds_ml_ready = store_ml_data_flattened(ds_ml_ready, ml_data_flat, grid_indices, dataset_name)
 
-    # Count valid samples
-    print(f"Data stored as: '{dataset_name}' with universal mapping")
+    print(f"Data stored as: '{dataset_name}'")
     
     return ds_ml_ready
 
@@ -648,16 +566,46 @@ def reshape_data_for_ml(ds_Sv, data_var='Sv_corrected', dataset_name='ml_data_cl
 def normalize_data(ds_ml_ready, method='standard', pre_L2_method='standard', 
                   shift_positive=False, per_feature=True, dataset_name='ml_data_clean', 
                   normalization_name=None, feature_weights=None, n_quantiles=100, flatten_weight=1):
+    """Normalize flattened ML data using a variety of scaling methods.
+
+    Supports per-feature and global normalization, optional L2 row
+    normalization with a configurable pre-scaler, power-transform
+    flattening, UMAP embedding, and feature weighting.
+
+    Parameters
+    ----------
+    ds_ml_ready : xr.Dataset
+        Dataset produced by :func:`reshape_data_for_ml`.
+    method : str, optional
+        Normalization method.  One of ``'standard'``, ``'robust'``,
+        ``'minmax'``, ``'flatten'``, ``'power'``, ``'quantile'``,
+        ``'umap'``, ``'flatten_plus_umap'``, or ``'l2'``
+        (default ``'standard'``).
+    pre_L2_method : str, optional
+        Scaler applied before L2 normalization when *method* is ``'l2'``
+        (default ``'standard'``).
+    shift_positive : bool, optional
+        Shift all values to be positive after normalization
+        (default ``False``).
+    per_feature : bool, optional
+        Normalize each feature independently (default ``True``).
+    dataset_name : str, optional
+        Base dataset name (default ``'ml_data_clean'``).
+    normalization_name : str or None, optional
+        Suffix for the stored result.  Defaults to *method* name.
+    feature_weights : array-like or None, optional
+        Per-feature multiplicative weights (default ``None``).
+    n_quantiles : int, optional
+        Number of quantiles for ``'quantile'`` method (default ``100``).
+    flatten_weight : float, optional
+        Blending weight for ``'flatten'`` method’s CDF transform
+        (default ``1``).
+
+    Returns
+    -------
+    ds_ml_ready : xr.Dataset
+        Dataset with the normalized data added.
     """
-    Normalize ML data with optional efficient flattened storage.
-    
-    Parameters:
-    -----------
-    normalization_name : str, optional
-        Name suffix for the normalized dataset. If None, uses the method name (default: None)
-    """
-    # Import sklearn modules at function level to avoid module-level imports
-    
     # Set default normalization_name based on method
     if normalization_name is None:
         if method == 'l2':
@@ -665,10 +613,8 @@ def normalize_data(ds_ml_ready, method='standard', pre_L2_method='standard',
         else:
             normalization_name = f'{method}_normalized'
     
-    # Extract valid samples for normalization - UPDATED CALL
     X_clean, _, _ = extract_valid_samples_for_sklearn(ds_ml_ready, specific_data_name='', dataset_name=dataset_name)
-    
-    # Apply normalization - preserve all original functionality
+
     if per_feature:
         if method == 'l2':
             # L2 normalization with optional pre-normalization
@@ -759,7 +705,7 @@ def normalize_data(ds_ml_ready, method='standard', pre_L2_method='standard',
                 'feature_scales': scaler.scale_ if hasattr(scaler, 'scale_') else None
             }
     else:
-        # Global normalization across all features - preserve original logic
+        # Global normalization across all features
         print(f"Using GLOBAL normalization (treating all features together)")
         
         X_flat = X_clean.flatten()
@@ -801,14 +747,14 @@ def normalize_data(ds_ml_ready, method='standard', pre_L2_method='standard',
                 'global_range': global_range
             }
 
-    # Apply positive shift if requested - preserve original logic
+    # Apply positive shift if requested
     if shift_positive:
         min_value = X_normalized.min()
         if min_value < 0:
             X_normalized = X_normalized + abs(min_value) + 1e-6
             normalization_info['shift_amount'] = abs(min_value) + 1e-6
 
-    # Apply feature weights if provided
+    # Apply feature weights
     if feature_weights is not None and per_feature:
         if len(feature_weights) != X_normalized.shape[1]:
             raise ValueError(f"feature_weights length ({len(feature_weights)}) must match number of features ({X_normalized.shape[1]})")
@@ -816,7 +762,7 @@ def normalize_data(ds_ml_ready, method='standard', pre_L2_method='standard',
         normalization_info['feature_weights'] = feature_weights
         print(f"Applied feature weights: {feature_weights}")
 
-    # Print statements - preserve original format
+    # Print summary
     print(f"Normalization method: {method}")
     if not per_feature and method != 'l2':
         print(f"Normalization scope: GLOBAL (across all features)")
@@ -830,27 +776,25 @@ def normalize_data(ds_ml_ready, method='standard', pre_L2_method='standard',
     print(f"Normalized mean per feature: {X_normalized.mean(axis=0)}")
     print(f"Normalized std per feature: {X_normalized.std(axis=0)}")
 
-    # Use the source data's existing coordinate name, not create a new one
-    source_sample_index_coord_name = f'{dataset_name}_sample_index'  # e.g., 'ml_data_clean_sample_index'
-    normalized_data_name = f'{dataset_name}_{normalization_name}'    # e.g., 'ml_data_clean_standard'
+    # Store in dataset using the source data's coordinate system
+    source_sample_index_coord_name = f'{dataset_name}_sample_index'
+    normalized_data_name = f'{dataset_name}_{normalization_name}'
     
-    # Get feature dimension name from source data
     source_data = ds_ml_ready[dataset_name]
     feature_dim_name = [dim for dim in source_data.dims if dim != f'{dataset_name}_sample_index'][0]
     
-    # Store normalized data using correct dimension name
+    # Store normalized data
     ml_data_normalized = xr.DataArray(
         X_normalized,
         dims=[source_sample_index_coord_name, feature_dim_name],
         coords={
             source_sample_index_coord_name: ds_ml_ready[dataset_name].coords[source_sample_index_coord_name],
-            feature_dim_name: ds_ml_ready[dataset_name].coords[feature_dim_name]  # Use actual feature coords
+            feature_dim_name: ds_ml_ready[dataset_name].coords[feature_dim_name]
         }
     )
-    
-    # Store using existing coordinate system - no new mapping needed
+
     ds_ml_ready[normalized_data_name] = ml_data_normalized
-    print(f"Stored normalized data as '{normalized_data_name}' using existing {source_sample_index_coord_name} coordinates")
+    print(f"Stored normalized data as '{normalized_data_name}'")
     
     feature_names = ds_ml_ready[dataset_name].coords[feature_dim_name].values
     visualize_normalized_data_histogram(X_normalized, feature_names=feature_names)
@@ -858,9 +802,19 @@ def normalize_data(ds_ml_ready, method='standard', pre_L2_method='standard',
     return ds_ml_ready
 
 def visualize_normalized_data_histogram(X_normalized, feature_names=None, n_bins=200, as_density=True, percentile_range=(.1, 99.9)):
+    """Plot overlaid histograms of each feature after normalization.
 
-
-    # Basic checks
+    Args:
+        X_normalized (np.ndarray): 2-D array of shape
+            ``(n_samples, n_features)``.
+        feature_names (list[str] or None): Labels for each feature.
+            Auto-generated when None. Defaults to None.
+        n_bins (int): Number of histogram bins. Defaults to 200.
+        as_density (bool): Plot as probability density. Defaults to True.
+        percentile_range (tuple[float] or None): ``(lower, upper)``
+            percentiles for the x-axis range. Use ``None`` for the full
+            data range. Defaults to (0.1, 99.9).
+    """
     if X_normalized.ndim != 2:
         raise ValueError("X_normalized must be 2D (n_samples, n_features)")
     n_features = X_normalized.shape[1]
@@ -914,17 +868,22 @@ def visualize_normalized_data_histogram(X_normalized, feature_names=None, n_bins
 
 
 def extract_valid_samples_for_sklearn(ds_ml_ready, specific_data_name=None, dataset_name='ml_data_clean'):
-    """
-    Updated extraction using universal mapping with consistent specific_data_name convention.
-    
-    Parameters:
-    -----------
-    ds_ml_ready : xarray.Dataset
-        Dataset with flattened data
-    specific_data_name : str
-        Specific data suffix (e.g., 'standard_normalized', 'kmeans_clusters', '', etc.)
-    dataset_name : str
-        Base dataset name (e.g., 'ml_data_clean')
+    """Extract flattened ML data as a NumPy array for scikit-learn.
+
+    Args:
+        ds_ml_ready (xr.Dataset): Dataset containing flattened ML data.
+        specific_data_name (str or None): Suffix identifying a particular
+            stored result (e.g. ``'standard_normalized'``). Pass ``''``
+            or ``None`` for the base dataset. Defaults to None.
+        dataset_name (str): Base dataset name. Defaults to 'ml_data_clean'.
+
+    Returns:
+        tuple: A tuple of (X, grid_indices, result_sample_indices) where:
+            X (np.ndarray): Feature matrix of shape
+            ``(n_samples, n_features)``.
+            grid_indices (np.ndarray): Corresponding grid indices.
+            result_sample_indices (np.ndarray): Sample-index coordinate
+            values.
     """
     # Construct full variable name using consistent convention
     full_data_var = f"{dataset_name}_{specific_data_name}" if specific_data_name is not None and specific_data_name != "" and dataset_name != specific_data_name else dataset_name
@@ -951,32 +910,34 @@ def extract_valid_samples_for_sklearn(ds_ml_ready, specific_data_name=None, data
     
 
 def store_ml_results_flattened(ds_ml_ready, flat_results, specific_data_name, dataset_name='ml_data_clean', result_sample_indices=None):
-    """
-    Store ML results using subset of sample_index indices (no separate index array needed).
-    
-    Parameters:
-    -----------
-    ds_ml_ready : xarray.Dataset
-        Dataset with universal sample_index_to_grid_index mapping
-    flat_results : numpy.ndarray
-        1D array of ML results
+    """Store 1-D ML results aligned to the flattened sample index.
+
+    Parameters
+    ----------
+    ds_ml_ready : xr.Dataset
+        Dataset with the sample-index-to-grid-index mapping.
+    flat_results : np.ndarray
+        1-D array of ML results (e.g. cluster labels).
     specific_data_name : str
-        Name for the stored result variable
-    dataset_name : str
-        Base name for the dataset to use data-specific coordinate names
-    result_sample_indices : numpy.ndarray, optional
-        Custom sample indices for results. If None, uses all samples from dataset_name.
-        Must be a subset of dataset_name sample indices. (default: None)
+        Suffix used for the stored variable name.
+    dataset_name : str, optional
+        Base dataset name (default ``'ml_data_clean'``).
+    result_sample_indices : np.ndarray or None, optional
+        Sample indices corresponding to *flat_results*.  Must be a
+        subset of the dataset’s sample indices.  If ``None``, assumes
+        all samples are present (default ``None``).
+
+    Returns
+    -------
+    ds_ml_ready : xr.Dataset
+        Dataset with the results added.
     """
 
     mapping_name = f'{dataset_name}_sample_index_to_grid_index'
     sample_index_coord_name = f'{dataset_name}_sample_index'
-
-    # Get source data sample indices
     source_sample_indices = ds_ml_ready[dataset_name].coords[sample_index_coord_name].values
 
     if result_sample_indices is None:
-
         if len(flat_results) != len(source_sample_indices):
             raise ValueError(
                 f"Length mismatch detected!\n"
@@ -991,12 +952,10 @@ def store_ml_results_flattened(ds_ml_ready, flat_results, specific_data_name, da
         result_sample_indices = source_sample_indices
         print(f"Using all {len(source_sample_indices)} samples from '{dataset_name}'")
     else:
-        # Validation: ensure result_sample_indices is a subset of source
         if not np.all(np.isin(result_sample_indices, source_sample_indices)):
             invalid_indices = result_sample_indices[~np.isin(result_sample_indices, source_sample_indices)]
             raise ValueError(f"result_sample_indices contains invalid indices not in {dataset_name}: {invalid_indices[:5]}...")
         
-        # Validation: ensure lengths match
         if len(flat_results) != len(result_sample_indices):
             raise ValueError(f"Length mismatch: flat_results has {len(flat_results)} elements "
                             f"but result_sample_indices has {len(result_sample_indices)} elements")
@@ -1033,29 +992,32 @@ def store_ml_results_flattened(ds_ml_ready, flat_results, specific_data_name, da
 
 
 def extract_ml_data_gridded(ds_ml_ready, specific_data_name="", dataset_name='ml_data_clean', fill_value=-1, store_in_dataset=False):
-    """
-    Convert flattened ML results back to grid using universal mapping.
-    Now supports both single-dimensional results (e.g., clusters) and multi-dimensional data (e.g., normalized ML data with channels).
-    
-    Parameters:
-    -----------
-    ds_ml_ready : xarray.Dataset
-        Dataset with universal sample_index_to_grid_index mapping
-    specific_data_name : str
-        Name of the result variable to regrid (can be clusters, normalized data, etc.)
-    dataset_name : str
-        Base name for the dataset to use data-specific coordinate names
-    fill_value : int/float
-        Fill value for missing grid points
-    store_in_dataset : bool
-        Whether to store gridded results in dataset
+    """Regrid flattened ML results back to the original spatial grid.
+
+    Supports both single-valued results (e.g. cluster labels) and
+    multi-feature data (e.g. normalized Sv with a channel dimension).
+
+    Args:
+        ds_ml_ready (xr.Dataset): Dataset with the
+            sample-index-to-grid-index mapping.
+        specific_data_name (str): Suffix of the stored result to regrid.
+            Defaults to '' (base dataset).
+        dataset_name (str): Base dataset name.
+            Defaults to 'ml_data_clean'.
+        fill_value (int or float): Value used for grid cells without ML
+            results. Defaults to -1.
+        store_in_dataset (bool): If True, store the gridded result in the
+            dataset. Defaults to False.
+
+    Returns:
+        xr.DataArray: Gridded result with original spatial coordinates.
     """
 
 
     mapping_name = f'{dataset_name}_sample_index_to_grid_index'
     sample_index_coord_name = f'{dataset_name}_sample_index'
-    full_result_name = f"{dataset_name}_{specific_data_name}" if (specific_data_name != "" and specific_data_name is not dataset_name and specific_data_name is not None) else dataset_name
-    
+    full_result_name = f"{dataset_name}_{specific_data_name}" if (specific_data_name != "" and specific_data_name != dataset_name and specific_data_name is not None) else dataset_name
+
     if mapping_name not in ds_ml_ready:
         raise ValueError(f"Universal {mapping_name} mapping required")
 
@@ -1068,45 +1030,28 @@ def extract_ml_data_gridded(ds_ml_ready, specific_data_name="", dataset_name='ml
     if unique_grid_index_name in ds_ml_ready.coords: 
         grid_index_name = unique_grid_index_name
     
-    # Get the results and their sample_index coordinates
     flat_results = ds_ml_ready[full_result_name]
     result_sample_indices = flat_results.coords[sample_index_coord_name].values
-    
-    # Use universal mapping with coordinate selection
-    # grid_indices = ds_ml_ready[mapping_name].sel(**{sample_index_coord_name: result_sample_indices}).values
+
     grid_indices = ds_ml_ready[mapping_name][result_sample_indices].values
 
-    # Added this code to handle alternate coordinates
     grid_coords = get_grid_coordinates(ds_ml_ready, grid_index_name)
-
-    # Get the shape of the original 2D data
     grid_index_shape = ds_ml_ready[grid_index_name].shape
-
-    # Use np.unravel_index to get the 2D indices
-    #    This returns a tuple: (ping_time_indices, range_sample_indices)
     ping_indices, range_sample_indices = np.unravel_index(grid_indices, grid_index_shape)
 
-    # Determine if this is multi-dimensional (has feature dimension) or single-dimensional
+    # Determine if this is multi-dimensional (has feature dimension)
     feature_dims = [dim for dim in flat_results.dims if dim != sample_index_coord_name]
     has_features = len(feature_dims) > 0
 
     if has_features:
-        # Multi-dimensional case (e.g., normalized ML data with features)
-        feature_dim_name = feature_dims[0]  # Get the actual feature dimension name
+        feature_dim_name = feature_dims[0]
         n_features = flat_results.sizes[feature_dim_name]
 
-        # use correct sizes for the grid dimensions
         grid_shape = (n_features, ds_ml_ready.sizes[grid_coords[0]], ds_ml_ready.sizes[grid_coords[1]])
         result_grid = np.full(grid_shape, fill_value, dtype=np.float64)
-        
-        # Convert grid indices back to grid coordinates
-        # print("ping_indices:", ping_indices)
-        # print("range_sample_indices:", range_sample_indices)
 
-        # Fill in the results for all features
         result_grid[:, ping_indices, range_sample_indices] = flat_results.values.T.astype(np.float64)
-        
-        # Create DataArray with correct dimension order
+
         result_grid_da = xr.DataArray(
             result_grid,
             dims=[feature_dim_name, grid_coords[0], grid_coords[1]],
@@ -1125,11 +1070,8 @@ def extract_ml_data_gridded(ds_ml_ready, specific_data_name="", dataset_name='ml
         # Single-dimensional case (e.g., cluster labels) - existing logic
         grid_shape = (ds_ml_ready.sizes[grid_coords[0]], ds_ml_ready.sizes[grid_coords[1]])
         result_grid = np.full(grid_shape, fill_value, np.float64)
-        
-        # Fill in the results
         result_grid[ping_indices, range_sample_indices] = flat_results.values.astype(np.float64)
-        
-        # Create DataArray with correct dimension order (ping_time, range_sample)
+
         result_grid_da = xr.DataArray(
             result_grid,
             dims=[grid_coords[0], grid_coords[1]],
@@ -1139,11 +1081,8 @@ def extract_ml_data_gridded(ds_ml_ready, specific_data_name="", dataset_name='ml
             }
         )
 
-        # print("result_grid:", result_grid)
-        
-        # Print summary for single-dimensional results
         unique_values, counts = np.unique(flat_results.values, return_counts=True)
-        print(f"Regridded {len(flat_results):,} ML results to grid using lookup arrays")
+        print(f"Regridded {len(flat_results):,} results to grid")
         print(f"Grid shape: {grid_shape}, fill value: {fill_value}")
     
     result_grid_da.attrs['long_name'] = f'ML {specific_data_name} (gridded)' if specific_data_name else f'ML {dataset_name} (gridded)'
@@ -1175,34 +1114,43 @@ def apply_dbscan_clustering(
         cluster_selection_method='eom',
         soft_membership_threshold=None
         ):
-    """
-    Apply DBSCAN or HDBSCAN clustering with different parameter combinations 
-    
-    Parameters:
-    -----------
-    X_normalized : numpy.ndarray
-        Normalized feature matrix
-    sample_indices : numpy.ndarray
-        Sample indices corresponding to X_normalized rows
-    eps_values : list
-        List of eps values (maximum distance between samples in a neighborhood) - only used for DBSCAN
-    min_samples_values : list
-        List of min_samples values (minimum samples in a neighborhood for core point)
-    sample_size : int
-        Number of samples to use. If None, uses all data
-    calculate_silhouette : bool
-        Whether to calculate silhouette score (can be slow for large datasets)
-    silhouette_sample_size : int
-        Sample size for silhouette score calculation (to speed up computation)
-    useHDBScan : bool
-        If True, uses HDBSCAN (hierarchical). If False, uses standard DBSCAN
-    min_cluster_size : int
-        Minimum cluster size (used as post-filter for DBSCAN, parameter for HDBSCAN)
-        
+    """Run DBSCAN or HDBSCAN clustering over a parameter grid.
+
+    Iterates over the provided parameter values, fits a model for each
+    combination, and returns results including labels and scores.
+
+    Args:
+        X_normalized (np.ndarray): Feature matrix of shape
+            ``(n_samples, n_features)``.
+        sample_indices (np.ndarray): Grid-index values corresponding to
+            each row of *X_normalized*.
+        eps_values (list[float]): Epsilon values for DBSCAN neighbourhood
+            radius (ignored when *useHDBScan* is True).
+            Defaults to [0.3, 0.5, 0.7, 1.0].
+        min_samples_values (list[int]): Core-point neighbourhood sizes
+            to try. Defaults to [5, 10, 20].
+        sample_size (int or None): Sub-sample size for large datasets.
+            Defaults to None (all data).
+        calculate_silhouette (bool): Compute silhouette scores.
+            Defaults to True.
+        silhouette_sample_size (int): Sample size for faster silhouette
+            calculation. Defaults to 10000.
+        metric (str): Distance metric. Defaults to 'euclidean'.
+        algorithm (str): DBSCAN algorithm variant. Defaults to 'auto'.
+        useHDBScan (bool): Use HDBSCAN instead of DBSCAN.
+            Defaults to False.
+        min_cluster_size (int): Minimum cluster size (HDBSCAN parameter /
+            DBSCAN post-filter). Defaults to 5.
+        cluster_selection_method (str): HDBSCAN cluster selection method.
+            Defaults to 'eom'.
+        soft_membership_threshold (float or None): If set, reassign
+            HDBSCAN noise points whose soft-membership probability
+            exceeds this threshold. Defaults to None.
+
     Returns:
-    --------
-    results : dict
-        Dictionary containing clustering results for each parameter combination
+        dict: Keyed by parameter string, each value is a dict with keys
+        ``'model'``, ``'labels'``, ``'silhouette_score'``,
+        ``'sample_indices'``, ``'n_clusters'``, ``'n_noise'``, etc.
     """
     
     # Use all data or sample based on parameter
@@ -1220,8 +1168,7 @@ def apply_dbscan_clustering(
     results = {}
     
     if useHDBScan:
-        # HDBSCAN: Only loop through min_samples (eps is not used)
-        print("\n=== HDBSCAN CLUSTERING RESULTS (OPTIMIZED) ===")
+        print("\n=== HDBSCAN CLUSTERING RESULTS ===")
         if calculate_silhouette and len(X_sample) > silhouette_sample_size:
             print(f"Note: Silhouette scores calculated on sample of {silhouette_sample_size:,} points for efficiency")
         
@@ -1229,8 +1176,7 @@ def apply_dbscan_clustering(
             param_key = f"hdbscan_mincluster_{min_cluster_size}_min_{min_samples}"
             print(f"\nTesting HDBSCAN with min_cluster_size={min_cluster_size}, min_samples={min_samples}...")
             
-            # Apply HDBSCAN - timing the clustering
-            import time
+            # Apply HDBSCAN
             start_time = time.time()
             
             if metric == "mahalanobis":
@@ -1283,7 +1229,7 @@ def apply_dbscan_clustering(
     
     else:
         # Standard DBSCAN: Loop through eps and min_samples
-        print("\n=== DBSCAN CLUSTERING RESULTS (OPTIMIZED) ===")
+        print("\n=== DBSCAN CLUSTERING RESULTS ===")
         if calculate_silhouette and len(X_sample) > silhouette_sample_size:
             print(f"Note: Silhouette scores calculated on sample of {silhouette_sample_size:,} points for efficiency")
         
@@ -1292,8 +1238,7 @@ def apply_dbscan_clustering(
                 param_key = f"eps_{eps}_min_{min_samples}"
                 print(f"\nTesting DBSCAN with eps={eps}, min_samples={min_samples}...")
                 
-                # Apply DBSCAN - timing the clustering
-                import time
+                # Apply DBSCAN
                 start_time = time.time()
                 model = DBSCAN(eps=eps, min_samples=min_samples, metric=metric, algorithm=algorithm)
                 cluster_labels = model.fit_predict(X_sample)
@@ -1332,20 +1277,17 @@ def apply_dbscan_clustering(
 
 
 def assign_noise_by_soft_membership(clusterer, threshold=0.1):
-    """
-    Assign noise points to clusters based on soft membership probabilities.
+    """Assign noise points to clusters based on soft membership probabilities.
 
-    Parameters:
-    -----------
-    clusterer : hdbscan.HDBSCAN
-        Fitted HDBSCAN clusterer with prediction_data=True.
-    threshold : float
-        Minimum probability required to assign a noise point to a cluster.
+    Args:
+        clusterer (hdbscan.HDBSCAN): Fitted HDBSCAN clusterer with
+            ``prediction_data=True``.
+        threshold (float): Minimum probability required to assign a noise
+            point to a cluster. Defaults to 0.1.
 
     Returns:
-    --------
-    new_labels : np.ndarray
-        Cluster labels with noise points reassigned if their max probability exceeds threshold.
+        np.ndarray: Cluster labels with noise points reassigned if their
+        max probability exceeds *threshold*.
     """
     print("start reassignment")
     # Get hard cluster labels
@@ -1380,9 +1322,19 @@ def assign_noise_by_soft_membership(clusterer, threshold=0.1):
 
 
 def _calculate_silhouette(X_sample, cluster_labels, n_clusters, calculate_silhouette, silhouette_sample_size):
-    """Helper function to calculate silhouette score with sampling for efficiency"""
+    """Compute silhouette score, optionally on a random subsample.
+
+    Args:
+        X_sample (np.ndarray): Feature matrix.
+        cluster_labels (np.ndarray): Cluster label per sample.
+        n_clusters (int): Number of clusters found.
+        calculate_silhouette (bool): Whether to compute the score.
+        silhouette_sample_size (int): Maximum samples for calculation.
+
+    Returns:
+        float: Silhouette score, or -1 if not computed.
+    """
     if calculate_silhouette and n_clusters > 1 and n_clusters < len(X_sample):
-        import time
         sil_start_time = time.time()
         try:
             if len(X_sample) > silhouette_sample_size:
@@ -1402,16 +1354,24 @@ def _calculate_silhouette(X_sample, cluster_labels, n_clusters, calculate_silhou
                 
             sil_time = time.time() - sil_start_time
             print(f"  Silhouette calculation took: {sil_time:.2f} seconds")
-        except:
-            sil_score = -1  # Invalid score if silhouette calculation fails
+        except Exception:
+            sil_score = -1
     else:
-        sil_score = -1  # No meaningful clustering or silhouette disabled
-    
+        sil_score = -1
+
     return sil_score
 
 
 def print_basic_cluster_stats(cluster_labels, n_clusters, n_noise, sil_score, calculate_silhouette):
-    """Helper function to print cluster statistics"""
+    """Print a summary table of cluster sizes and silhouette score.
+
+    Args:
+        cluster_labels (np.ndarray): Cluster label per sample.
+        n_clusters (int): Number of clusters.
+        n_noise (int): Number of noise points.
+        sil_score (float): Silhouette score.
+        calculate_silhouette (bool): Whether silhouette was requested.
+    """
     unique_labels, counts = np.unique(cluster_labels, return_counts=True)
     print(f"  Number of clusters: {n_clusters}")
     print(f"  Noise points: {n_noise} ({n_noise/len(cluster_labels)*100:.1f}%)")
@@ -1441,18 +1401,25 @@ def print_basic_cluster_stats(cluster_labels, n_clusters, n_noise, sil_score, ca
 # kmeans clustering
 def apply_kmeans_clustering(X_normalized, sample_indices, k_values=[3, 5, 7], sample_size=None, 
                            calculate_silhouette=True, silhouette_sample_size=10000):
-    """
-    Apply K-means clustering with different numbers of clusters - OPTIMIZED
-    
-    Parameters:
-    -----------
-    X_normalized : numpy.ndarray
-        Normalized feature matrix
-    sample_indices : numpy.ndarray
-        Sample indices corresponding to X_normalized rows
-    k_values : list
-        List of k values (number of clusters) to try
+    """Run K-means clustering for each value of *k*.
 
+    Args:
+        X_normalized (np.ndarray): Feature matrix of shape
+            ``(n_samples, n_features)``.
+        sample_indices (np.ndarray): Grid-index values for each row.
+        k_values (list[int]): Numbers of clusters to try.
+            Defaults to [3, 5, 7].
+        sample_size (int or None): Sub-sample size for large datasets.
+            Defaults to None.
+        calculate_silhouette (bool): Compute silhouette scores.
+            Defaults to True.
+        silhouette_sample_size (int): Sample size for faster silhouette
+            calculation. Defaults to 10000.
+
+    Returns:
+        dict: Keyed by *k*, each value is a dict with ``'model'``,
+        ``'labels'``, ``'silhouette_score'``, ``'inertia'``, and
+        ``'sample_indices'``.
     """
     
     if sample_size is not None and sample_size < len(X_normalized):
@@ -1461,7 +1428,7 @@ def apply_kmeans_clustering(X_normalized, sample_indices, k_values=[3, 5, 7], sa
         subsample_mask = np.random.choice(len(X_normalized), size=sample_size, replace=False)
         X_sample = X_normalized[subsample_mask]
         used_sample_indices = sample_indices[subsample_mask]  # Get corresponding indices
-    # Use all data or sample based on parameter
+    # Use all data or subsample
     else:
         print(f"Using ALL {len(X_normalized):,} valid data points for clustering")
         X_sample = X_normalized
@@ -1470,12 +1437,12 @@ def apply_kmeans_clustering(X_normalized, sample_indices, k_values=[3, 5, 7], sa
     
     results = {}
     
-    print("\\n=== K-MEANS CLUSTERING RESULTS (OPTIMIZED) ===")
+    print("\n=== K-MEANS CLUSTERING RESULTS ===")
     if calculate_silhouette and len(X_sample) > silhouette_sample_size:
         print(f"Note: Silhouette scores calculated on sample of {silhouette_sample_size:,} points for efficiency")
     
     for k in k_values:
-        print(f"\\nTesting K-means with k={k} clusters...")
+        print(f"\nTesting K-means with k={k} clusters...")
         
         kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
         cluster_labels = kmeans.fit_predict(X_sample)
@@ -1518,24 +1485,19 @@ def apply_kmeans_clustering(X_normalized, sample_indices, k_values=[3, 5, 7], sa
 
 
 def apply_min_cluster_size_filter(cluster_labels, min_cluster_size):
-    """
-    Apply min_cluster_size filtering to DBSCAN results as post-processing.
-    
-    Clusters smaller than min_cluster_size are reclassified as noise (-1).
+    """Apply min_cluster_size filtering to DBSCAN results as post-processing.
+
+    Clusters smaller than *min_cluster_size* are reclassified as noise (-1).
     Remaining clusters are renumbered to be consecutive starting from 0.
-    
-    Parameters:
-    -----------
-    cluster_labels : numpy.ndarray
-        Original cluster labels from DBSCAN
-    min_cluster_size : int
-        Minimum number of points required for a cluster to be kept
-        
+
+    Args:
+        cluster_labels (np.ndarray): Original cluster labels from DBSCAN.
+        min_cluster_size (int): Minimum number of points required for a
+            cluster to be kept.
+
     Returns:
-    --------
-    filtered_labels : numpy.ndarray
-        Filtered cluster labels with small clusters converted to noise and
-        remaining clusters renumbered consecutively
+        np.ndarray: Filtered cluster labels with small clusters converted
+        to noise and remaining clusters renumbered consecutively.
     """
     if min_cluster_size <= 1:
         return cluster_labels.copy()
@@ -1590,38 +1552,33 @@ def apply_min_cluster_size_filter(cluster_labels, min_cluster_size):
 
 def extract_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_data_clean', 
                                normalize_data_name=None, sv_data_var=None, compute_pairwise_diffs=False):
-    """
-    Extract statistics for each cluster.
-    
-    Parameters:
-    -----------
-    ds_ml_ready : xarray.Dataset
-        Dataset containing cluster labels and source data
-    cluster_data_name : str
-        Name of the cluster labels variable (e.g., 'kmeans_clusters_k_5', 'dbscan_clusters_5')
-    dataset_name : str
-        Base dataset name (e.g., 'ml_data_clean')
-    normalize_data_name : str, optional
-        Name of normalized data to use for statistics (default: None, uses dataset_name)
-    sv_data_var : str, optional
-        Name of original Sv variable to use for statistics (e.g., 'Sv', 'Sv_corrected').
-        If provided, statistics will be calculated from gridded Sv data instead of 
-        flattened normalized data (default: None)
-    compute_pairwise_diffs : bool, optional
-        If True and sv_data_var is provided, compute pairwise differences between channels
-        in addition to original channel values. Differences will use naming format
-        'ch1-ch0', 'ch2-ch0', etc. (default: False)
-        
+    """Extract statistics for each cluster.
+
+    Args:
+        ds_ml_ready (xr.Dataset): Dataset containing cluster labels and
+            source data.
+        cluster_data_name (str): Name of the cluster labels variable
+            (e.g. ``'kmeans_clusters_k_5'``, ``'dbscan_clusters_5'``).
+        dataset_name (str): Base dataset name.
+            Defaults to 'ml_data_clean'.
+        normalize_data_name (str or None): Name of normalized data to use
+            for statistics. Defaults to None (uses *dataset_name*).
+        sv_data_var (str or None): Name of original Sv variable to use
+            for statistics (e.g. ``'Sv'``, ``'Sv_corrected'``). If
+            provided, statistics are calculated from gridded Sv data
+            instead of flattened normalized data. Defaults to None.
+        compute_pairwise_diffs (bool): If True and *sv_data_var* is
+            provided, compute pairwise differences between channels in
+            addition to original channel values. Defaults to False.
+
     Returns:
-    --------
-    stats_dict : dict
-        Dictionary containing:
-        - 'cluster_stats': list of dicts with per-cluster statistics
-        - 'noise_stats': dict with noise statistics (if present)
-        - 'metadata': dict with overall information
-        - 'feature_coords': array of feature names
-        - 'feature_dim_name': str name of feature dimension
-        - 'data_description': str describing source data
+        dict: Dictionary containing:
+            - ``'cluster_stats'``: list of dicts with per-cluster statistics.
+            - ``'noise_stats'``: dict with noise statistics (if present).
+            - ``'metadata'``: dict with overall information.
+            - ``'feature_coords'``: array of feature names.
+            - ``'feature_dim_name'``: str name of feature dimension.
+            - ``'data_description'``: str describing source data.
     """
     
     # Get cluster labels
@@ -1797,32 +1754,28 @@ def extract_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_
 
 def print_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_data_clean', 
                             normalize_data_name=None, sv_data_var=None, compute_pairwise_diffs=False):
-    """
-    Print statistics (mean and standard deviation) for each cluster.
-    
-    Parameters:
-    -----------
-    ds_ml_ready : xarray.Dataset
-        Dataset containing cluster labels and source data
-    cluster_data_name : str
-        Name of the cluster labels variable (e.g., 'kmeans_clusters_k_5', 'dbscan_clusters_5')
-    dataset_name : str
-        Base dataset name (e.g., 'ml_data_clean')
-    normalize_data_name : str, optional
-        Name of normalized data to use for statistics (default: None, uses dataset_name)
-    sv_data_var : str, optional
-        Name of original Sv variable to use for statistics (e.g., 'Sv', 'Sv_corrected').
-        If provided, statistics will be calculated from gridded Sv data instead of 
-        flattened normalized data (default: None)
-    compute_pairwise_diffs : bool, optional
-        If True and sv_data_var is provided, compute pairwise differences between channels
-        (default: False)
-        
+    """Print statistics (mean and standard deviation) for each cluster.
+
+    Args:
+        ds_ml_ready (xr.Dataset): Dataset containing cluster labels and
+            source data.
+        cluster_data_name (str): Name of the cluster labels variable
+            (e.g. ``'kmeans_clusters_k_5'``, ``'dbscan_clusters_5'``).
+        dataset_name (str): Base dataset name.
+            Defaults to 'ml_data_clean'.
+        normalize_data_name (str or None): Name of normalized data to use
+            for statistics. Defaults to None (uses *dataset_name*).
+        sv_data_var (str or None): Name of original Sv variable to use
+            for statistics (e.g. ``'Sv'``, ``'Sv_corrected'``). If
+            provided, statistics are calculated from gridded Sv data
+            instead of flattened normalized data. Defaults to None.
+        compute_pairwise_diffs (bool): If True and *sv_data_var* is
+            provided, compute pairwise differences between channels.
+            Defaults to False.
+
     Returns:
-    --------
-    stats_list : list
-        List of dictionaries containing statistics for each cluster
-        (for backwards compatibility)
+        list: List of dicts with per-cluster statistics (for backwards
+        compatibility).
     """
     
     # Extract statistics using the shared function
@@ -1894,17 +1847,36 @@ def plot_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_dat
                            stat_type='mean', include_noise=False, 
                            cluster_colors=None, figsize=(12, 6),
                            title=None, save_path=None, compute_pairwise_diffs=False):
-    """
-    Plot cluster statistics as bar charts with error bars (±1 std dev).
-    Features are grouped by type (Sv vs differences) with shared y-axes.
+    """Plot cluster statistics as bar charts with error bars.
 
+    Features are grouped by type (Sv vs differences) with shared y-axes.
     All Sv features share one y-axis, all difference features share another.
-    
-    Parameters:
-    -----------
-    compute_pairwise_diffs : bool, optional
-        If True and sv_data_var is provided, compute pairwise differences between channels
-        and plot them on a separate y-axis (default: False)
+
+    Args:
+        ds_ml_ready (xr.Dataset): Dataset containing cluster labels and
+            source data.
+        cluster_data_name (str): Name of the cluster labels variable.
+        dataset_name (str): Base dataset name.
+            Defaults to 'ml_data_clean'.
+        normalize_data_name (str or None): Name of normalized data.
+            Defaults to None.
+        sv_data_var (str or None): Name of original Sv variable.
+            Defaults to None.
+        stat_type (str): Statistic to plot: ``'mean'``, ``'min'``, or
+            ``'max'``. Defaults to 'mean'.
+        include_noise (bool): Include noise cluster in the plot.
+            Defaults to False.
+        cluster_colors (list[str] or None): Hex colour strings.
+            Defaults to None (uses built-in palette).
+        figsize (tuple): Figure size. Defaults to (12, 6).
+        title (str or None): Custom title. Defaults to None.
+        save_path (str or None): Path to save figure. Defaults to None.
+        compute_pairwise_diffs (bool): If True and *sv_data_var* is
+            provided, compute pairwise differences between channels
+            and plot them on a separate y-axis. Defaults to False.
+
+    Returns:
+        tuple: ``(fig, axes_list, stats_dict)``.
     """
     if cluster_colors is None:
         cluster_colors = [
@@ -2160,7 +2132,23 @@ def remove_noise(
         noise_ping_num=5,
         assign_to_sv=True
         ):
-    """Remove background noise from Sv data and align Sv/Sv_corrected variables."""
+    """Remove background noise from Sv data using echopype.
+
+    Wraps :func:`echopype.clean.remove_background_noise` and optionally
+    copies the corrected result into the ``Sv`` variable.
+
+    Args:
+        ds_Sv (xr.Dataset): Dataset with ``Sv`` data.
+        noise_range_sample_num (int): Number of range samples for noise
+            estimation. Defaults to 10.
+        noise_ping_num (int): Number of pings for noise estimation.
+            Defaults to 5.
+        assign_to_sv (bool): Copy ``Sv_corrected`` into ``Sv``.
+            Defaults to True.
+
+    Returns:
+        xr.Dataset: Dataset with background noise removed.
+    """
 
     ds_Sv_clean = ep.clean.remove_background_noise(
         ds_Sv,
@@ -2179,7 +2167,23 @@ def compute_mvbs(
         mvbs_ping_time_bin="10s",
         mvbs_nan_threshold=0.9
         ):
-    """Mask sparse bins and compute MVBS."""
+    """Compute Mean Volume Backscattering Strength (MVBS).
+
+    Optionally masks sparse bins before computing MVBS via echopype.
+
+    Args:
+        ds_Sv_clean (xr.Dataset): Noise-corrected Sv dataset.
+        mvbs_range_bin (str): Range bin size. Defaults to '2m'.
+        mvbs_ping_time_bin (str): Ping time bin size.
+            Defaults to '10s'.
+        mvbs_nan_threshold (float or None): Fraction of NaN values
+            above which a bin is masked. ``None`` skips this step.
+            Defaults to 0.9.
+
+    Returns:
+        tuple: ``(ds_Sv_clean, ds_MVBS)`` — input dataset (potentially
+        with sparse bins masked) and the MVBS dataset.
+    """
     if mvbs_nan_threshold is not None:
         ds_Sv_clean = utils.mask_sparse_bins(
             ds_Sv_clean,
@@ -2210,13 +2214,39 @@ def data_preprocessing_pipeline(
         overlay_line_var=None,
         overlay_line_path=None
         ):
-    
-    ds_Sv_clean = remove_noise(
-        ds_Sv,
-        noise_range_sample_num=noise_range_sample_num,
-        noise_ping_num=noise_ping_num,
-        remove_background_noise=remove_background_noise
-    )
+    """Run the full data preprocessing pipeline: noise removal, MVBS, and echograms.
+
+    Args:
+        ds_Sv (xr.Dataset): Raw Sv dataset.
+        echodata (ep.EchoData): Source EchoData object.
+        noise_range_sample_num (int): Noise estimation range samples.
+            Defaults to 10.
+        noise_ping_num (int): Noise estimation pings. Defaults to 5.
+        mvbs_range_bin (str): MVBS range bin. Defaults to '2m'.
+        mvbs_ping_time_bin (str): MVBS ping-time bin.
+            Defaults to '10s'.
+        mvbs_nan_threshold (float or None): NaN fraction threshold for
+            sparse-bin masking. Defaults to 0.9.
+        plot_window (list[int]): ``[min_depth, max_depth, ping_min,
+            ping_max]`` for echograms.
+        y_to_x_aspect_ratio_override (float or None): Override echogram
+            aspect ratio.
+        remove_background_noise (bool): Whether to remove background
+            noise. Defaults to True.
+        overlay_line_var (str or None): Variable name for overlay lines.
+        overlay_line_path (str or None): Path to overlay line file.
+
+    Returns:
+        tuple: ``(ds_Sv_clean, ds_MVBS)``.
+    """
+    if remove_background_noise:
+        ds_Sv_clean = remove_noise(
+            ds_Sv,
+            noise_range_sample_num=noise_range_sample_num,
+            noise_ping_num=noise_ping_num,
+        )
+    else:
+        ds_Sv_clean = ds_Sv
 
     ds_Sv_clean, ds_MVBS = compute_mvbs(
         ds_Sv_clean,
@@ -2241,7 +2271,6 @@ def data_preprocessing_pipeline(
 
     echogram.plot_sv_echogram(
         ds_Sv_clean, 
-        # frequency_nominal, 
         min_depth=plot_window[0],
         max_depth=plot_window[1],
         ping_min=plot_window[2],
@@ -2250,10 +2279,8 @@ def data_preprocessing_pipeline(
         y_axis_units="meters",
         echodata=echodata,
         y_to_x_aspect_ratio_override=y_to_x_aspect_ratio_override
-        # meters_per_second=5
     )
 
-    
     echogram.plot_sv_echogram(
         ds_MVBS, 
         ds_Sv_clean,
@@ -2264,7 +2291,6 @@ def data_preprocessing_pipeline(
         x_axis_units="seconds",
         y_axis_units="meters",
         echodata=echodata,
-        # meters_per_second=1
         y_to_x_aspect_ratio_override=y_to_x_aspect_ratio_override,
         overlay_lines=overlay_lines
     )
@@ -2272,7 +2298,7 @@ def data_preprocessing_pipeline(
 
 
 def reshape_and_normalize_data(
-        ds_Sv, # can be mvbs or regular sv
+        ds_Sv,
         custom_dataset_name, 
         ds_Sv_original=None,
         feature_strategy="baseline_plus_differences", 
@@ -2289,6 +2315,48 @@ def reshape_and_normalize_data(
         n_quantiles=100,
         cluster_colors=None
         ):
+    """Reshape data, normalize, and plot in a single convenience call.
+
+    Optionally excludes a previous clustering result via masking before
+    reshaping.  Produces an echogram of the normalized features.
+
+    Args:
+        ds_Sv (xr.Dataset): Sv or MVBS dataset.
+        custom_dataset_name (str): Name for the ML dataset stored in
+            the output.
+        ds_Sv_original (xr.Dataset or None): Original (un-binned) Sv
+            used for echogram depth reference.
+        feature_strategy (str): Feature extraction strategy.
+            Defaults to 'baseline_plus_differences'.
+        baseline_channel (int): Channel index for baseline features.
+            Defaults to 0.
+        data_var (str): Sv variable name. Defaults to 'Sv'.
+        custom_normalization_name (str): Name suffix for the normalized
+            output. Defaults to 'normalized_data'.
+        normalization_strategy (str): Normalization method, or ``'none'``
+            to skip. Defaults to 'standard'.
+        feature_weights (array-like or None): Per-feature multiplicative
+            weights.
+        plot_window (list[int]): ``[min_depth, max_depth, ping_min,
+            ping_max]``.
+        exclude_cluster_data_name (str or None): Previous cluster result
+            name for masking.
+        gridded_results_to_mask (xr.DataArray or None): Gridded cluster
+            labels to apply as an exclusion mask.
+        mask_cluster_label (int or None): Specific cluster label to
+            exclude.  When ``None`` the largest cluster is excluded
+            instead.
+        y_to_x_aspect_ratio_override (float or None): Echogram aspect
+            ratio override.
+        n_quantiles (int): Number of quantiles for ``'quantile'``
+            normalization. Defaults to 100.
+        cluster_colors (list[str] or None): Hex colours for cluster
+            display.
+
+    Returns:
+        xr.Dataset: Dataset with reshaped and (optionally) normalized
+        data.
+    """
     
     if cluster_colors is None:
         cluster_colors = [
@@ -2297,16 +2365,14 @@ def reshape_and_normalize_data(
             ]
 
     cluster_mask_name = None
-    # Exclude a specific cluster label (e.g. background cluster from first pass)
+    # Exclude a specific cluster label (e.g. background from a previous pass)
     if mask_cluster_label is not None and gridded_results_to_mask is not None:
         cluster_mask_name = f'{exclude_cluster_data_name or "cluster"}_mask'
         ds_Sv = add_cluster_label_mask(ds_Sv, gridded_results_to_mask, mask_cluster_label, mask_name=cluster_mask_name)
-    # Fallback: exclude largest cluster (legacy behavior)
     elif exclude_cluster_data_name is not None and gridded_results_to_mask is not None:
+        # Fallback: exclude the largest cluster
         cluster_mask_name = f'{exclude_cluster_data_name}_mask'
-        # Create the largest cluster mask
         ds_Sv = add_largest_cluster_mask(ds_Sv, gridded_results_to_mask, mask_name=cluster_mask_name)
-    
 
     ds_ml_ready = reshape_data_for_ml(
         ds_Sv, 
@@ -2317,7 +2383,7 @@ def reshape_and_normalize_data(
         custom_data_mask_name=cluster_mask_name
         )
     
-    if normalization_strategy is not "none":
+    if normalization_strategy != "none":
         ds_normalized = normalize_data(
             ds_ml_ready, 
             method=normalization_strategy, 
@@ -2331,7 +2397,7 @@ def reshape_and_normalize_data(
         ds_normalized = ds_ml_ready
         custom_normalization_name = custom_dataset_name
 
-    echogram.plot_flattend_data_echogram(
+    echogram.plot_flattened_data_echogram(
         ds_normalized, 
         custom_dataset_name,
         ds_Sv_original,
@@ -2372,6 +2438,52 @@ def extract_data_and_run_hdbscan(
         cluster_stats_sv_data_var="Sv",
         cluster_stats_compute_pairwise_differences=True
         ):
+    """Extract normalized data, run HDBSCAN/DBSCAN, store and visualise results.
+
+    Convenience wrapper that chains extraction, clustering, result storage,
+    echogram plotting, and cluster-statistics reporting.
+
+    Args:
+        ds_normalized (xr.Dataset): Dataset with normalized ML data.
+        custom_dataset_name (str): Base ML dataset name.
+        ds_Sv_original (xr.Dataset or None): Original Sv dataset for
+            echogram depth reference.
+        custom_normalization_name (str): Normalization result suffix.
+            Defaults to 'normalized_data'.
+        ml_result_name (str): Name for the clustering result.
+            Defaults to 'dbscan_clusters'.
+        plot_window (list[int]): ``[min_depth, max_depth, ping_min,
+            ping_max]``.
+        epsilon (float): DBSCAN epsilon. Defaults to 0.004.
+        min_samples (int): Core-point neighbourhood size.
+            Defaults to 2.
+        sample_size (int): Sub-sample size. Defaults to 1_000_000.
+        min_cluster_size (int): Minimum cluster size.
+            Defaults to 2000.
+        cluster_selection_method (str): HDBSCAN cluster-selection
+            method. Defaults to 'leaf'.
+        useHDBScan (bool): Use HDBSCAN instead of DBSCAN.
+            Defaults to True.
+        find_background_cluster (bool): Run background-cluster
+            detection. Defaults to False.
+        y_to_x_aspect_ratio_override (float or None): Echogram
+            aspect-ratio override.
+        soft_membership_threshold (float or None): Reassign noise
+            via soft-membership if set.
+        cluster_colors (list[str] or None): Hex colours for cluster
+            display.
+        overlay_line_var (str or None): Variable name for overlay
+            lines.
+        cluster_stats_sv_data_var (str): Sv variable for cluster
+            statistics. Defaults to 'Sv'.
+        cluster_stats_compute_pairwise_differences (bool): Compute
+            inter-channel pairwise diffs in stats. Defaults to True.
+
+    Returns:
+        tuple: ``(ds_final, gridded_results_dbscan, dbscan_results)``
+        or ``(ds_final, gridded_results_dbscan, dbscan_results,
+        background_label)`` when *find_background_cluster* is True.
+    """
 
     X, _, sample_indices = extract_valid_samples_for_sklearn(ds_normalized, custom_normalization_name, dataset_name=custom_dataset_name)
 
@@ -2436,7 +2548,7 @@ def extract_data_and_run_hdbscan(
 
 
 def full_dbscan_iteration(
-        ds_Sv, # can be mvbs or regular sv
+        ds_Sv,
         custom_dataset_name, 
         ds_Sv_original=None,
         feature_strategy="baseline_plus_differences", 
@@ -2465,6 +2577,67 @@ def full_dbscan_iteration(
         cluster_stats_sv_data_var="Sv",
         cluster_stats_compute_pairwise_differences=True
         ):
+    """End-to-end iteration: reshape, normalize, cluster, and visualise.
+
+    Combines :func:`reshape_and_normalize_data` and
+    :func:`extract_data_and_run_hdbscan` into one call, optionally
+    masking out a previous clustering result first.
+
+    Args:
+        ds_Sv (xr.Dataset): Sv or MVBS dataset.
+        custom_dataset_name (str): Name for the ML dataset.
+        ds_Sv_original (xr.Dataset or None): Original Sv for echogram
+            reference.
+        feature_strategy (str): Feature extraction strategy.
+            Defaults to 'baseline_plus_differences'.
+        baseline_channel (int): Channel index for baseline.
+            Defaults to 0.
+        data_var (str): Sv variable name. Defaults to 'Sv'.
+        custom_normalization_name (str): Normalization suffix.
+            Defaults to 'normalized_data'.
+        ml_result_name (str): Clustering result name.
+            Defaults to 'dbscan_clusters'.
+        normalization_strategy (str): Normalization method, or
+            ``'none'`` to skip. Defaults to 'standard'.
+        feature_weights (array-like or None): Per-feature multiplicative
+            weights.
+        plot_window (list[int]): ``[min_depth, max_depth, ping_min,
+            ping_max]``.
+        epsilon (float): DBSCAN epsilon. Defaults to 0.004.
+        min_samples (int): Core-point neighbourhood size.
+            Defaults to 2.
+        sample_size (int): Sub-sample size. Defaults to 1_000_000.
+        min_cluster_size (int): Minimum cluster size.
+            Defaults to 2000.
+        cluster_selection_method (str): HDBSCAN method.
+            Defaults to 'leaf'.
+        useHDBScan (bool): Use HDBSCAN. Defaults to True.
+        exclude_cluster_data_name (str or None): Previous cluster result
+            name for exclusion masking.
+        gridded_results_to_mask (xr.DataArray or None): Gridded cluster
+            labels for exclusion.
+        mask_cluster_label (int or None): Specific cluster label to
+            exclude.
+        find_background_cluster (bool): Detect background cluster.
+            Defaults to False.
+        y_to_x_aspect_ratio_override (float or None): Echogram aspect
+            ratio override.
+        n_quantiles (int): Number of quantiles for ``'quantile'``
+            normalization. Defaults to 100.
+        soft_membership_threshold (float or None): Reassign noise via
+            soft-membership if set.
+        cluster_colors (list[str] or None): Hex colours for display.
+        overlay_line_var (str or None): Variable name for overlay lines.
+        cluster_stats_sv_data_var (str): Sv variable for statistics.
+            Defaults to 'Sv'.
+        cluster_stats_compute_pairwise_differences (bool): Compute
+            pairwise channel diffs in statistics. Defaults to True.
+
+    Returns:
+        tuple: ``(ds_final, gridded_results, dbscan_results)`` or
+        ``(ds_final, gridded_results, dbscan_results,
+        background_label)`` when *find_background_cluster* is True.
+    """
     
     if cluster_colors is None:
         cluster_colors = [
@@ -2473,12 +2646,12 @@ def full_dbscan_iteration(
             ]
 
     cluster_mask_name = None
-    # Exclude a specific cluster label (e.g. background cluster from first pass)
+    # Exclude a specific cluster label (e.g. background from a previous pass)
     if mask_cluster_label is not None and gridded_results_to_mask is not None:
         cluster_mask_name = f'{exclude_cluster_data_name or "cluster"}_mask'
         ds_Sv = add_cluster_label_mask(ds_Sv, gridded_results_to_mask, mask_cluster_label, mask_name=cluster_mask_name)
-    # Fallback: exclude largest cluster (legacy behavior)
     elif exclude_cluster_data_name is not None and gridded_results_to_mask is not None:
+        # Fallback: exclude the largest cluster
         cluster_mask_name = f'{exclude_cluster_data_name}_mask'
         ds_Sv = add_largest_cluster_mask(ds_Sv, gridded_results_to_mask, mask_name=cluster_mask_name)
     
@@ -2492,7 +2665,7 @@ def full_dbscan_iteration(
         custom_data_mask_name=cluster_mask_name
         )
     
-    if normalization_strategy is not "none":
+    if normalization_strategy != "none":
         ds_normalized = normalize_data(
             ds_ml_ready, 
             method=normalization_strategy, 
@@ -2506,7 +2679,7 @@ def full_dbscan_iteration(
         ds_normalized = ds_ml_ready
         custom_normalization_name = custom_dataset_name
 
-    echogram.plot_flattend_data_echogram(
+    echogram.plot_flattened_data_echogram(
         ds_normalized, 
         custom_dataset_name,
         ds_Sv_original,
@@ -2547,21 +2720,34 @@ def full_dbscan_iteration(
 
 def retrieve_background_cluster(X, sample_indices, min_samples, sample_size, min_cluster_size, cluster_selection_method,
                                 feature_threshold=-0.2, min_fraction=0.1):
-    """Find a background cluster by iterating over epsilon values and checking all clusters.
-    
-    Returns the dbscan_results and the label of the identified background cluster.
-    A cluster qualifies as background if:
-      1. Its average feature[0] is below `feature_threshold` (default: -0.2)
-      2. It contains more than `min_fraction` (default: 10%) of total labeled samples
-    
-    Among qualifying clusters, the largest one is selected.
-    
-    Returns
-    -------
-    dbscan_results : dict
-        The clustering results dict from apply_dbscan_clustering.
-    background_label : int
-        The cluster label identified as background.
+    """Find a background cluster by iterating over epsilon values.
+
+    Returns the clustering results and the label of the identified
+    background cluster.  A cluster qualifies as background if:
+
+    1. Its average ``feature[0]`` is below *feature_threshold*.
+    2. It contains more than *min_fraction* of total labelled samples.
+
+    Among qualifying clusters the largest one is selected.
+
+    Args:
+        X (np.ndarray): Feature matrix.
+        sample_indices (np.ndarray): Grid-index values for each row.
+        min_samples (int): Core-point neighbourhood size.
+        sample_size (int): Sub-sample size.
+        min_cluster_size (int): Minimum cluster size.
+        cluster_selection_method (str): HDBSCAN cluster selection method.
+        feature_threshold (float): Maximum average ``feature[0]`` for a
+            cluster to qualify as background. Defaults to -0.2.
+        min_fraction (float): Minimum fraction of total labelled samples
+            a cluster must contain. Defaults to 0.1.
+
+    Returns:
+        tuple: ``(dbscan_results, background_label)``.
+
+    Raises:
+        ValueError: If no qualifying background cluster is found across
+            all epsilon values.
     """
     for epsilon in [0.05, .06, .07, .08, .09, .1, .2, .3, .4, .5]:
         print(f"Trying to find background cluster with eps={epsilon}")  
@@ -2591,7 +2777,11 @@ def retrieve_background_cluster(X, sample_indices, min_samples, sample_size, min
             continue
 
         total_samples = len(labels)
-        X_sample = X[used_sample_indices]
+
+        # Map grid indices back to positional indices in X
+        grid_idx_to_pos = {gi: pos for pos, gi in enumerate(sample_indices)}
+        sample_positions = np.array([grid_idx_to_pos[gi] for gi in used_sample_indices])
+        X_sample = X[sample_positions]
 
         # Iterate over all clusters and collect qualifying background candidates
         candidates = []  # list of (label, count, avg_feature0)
@@ -2618,8 +2808,18 @@ def retrieve_background_cluster(X, sample_indices, min_samples, sample_size, min
 
 
 def plot_dbscan_cluster_hierarchy(model, cluster_colors_by_index=None):
-    """
-    Plot HDBSCAN cluster hierarchy with correct color mapping.
+    """Plot HDBSCAN condensed tree with colours matching cluster labels.
+
+    Args:
+        model (hdbscan.HDBSCAN): Fitted HDBSCAN model.
+        cluster_colors_by_index (list[str] or None): Hex colour strings
+            indexed by cluster label. A default palette is used when
+            ``None``.
+
+    Returns:
+        tuple: ``(label_to_tree, palette_by_tree_order)`` — mapping from
+        final cluster label to condensed-tree cluster id, and colour
+        palette ordered by tree cluster id.
     """
     if cluster_colors_by_index is None:
         cluster_colors_by_index = [
@@ -2627,10 +2827,7 @@ def plot_dbscan_cluster_hierarchy(model, cluster_colors_by_index=None):
             "#EDFF4D", "#4E9200", "#970021", "#5600C7", "#017685FF", "#FFA600FF"
         ]
     
-    # Use model's labels
     final_labels = model.labels_
-    
-    # Get selected tree clusters and unique final labels (excluding noise)
     selected_clusters = model.condensed_tree_._select_clusters()
     unique_labels = sorted([l for l in set(final_labels) if l != -1])
     
@@ -2643,51 +2840,19 @@ def plot_dbscan_cluster_hierarchy(model, cluster_colors_by_index=None):
         cluster_colors_by_index = cluster_colors_by_index + additional_colors
         print(f"Warning: Generated {num_additional_colors} additional colors for clusters beyond base palette")
     
-    # HDBSCAN assigns final labels based on SORTED ORDER of selected tree clusters
-    # Create mapping: final_label -> tree_cluster_id
+    # HDBSCAN assigns final labels in sorted order of selected tree clusters
     label_to_tree = {}
     sorted_tree_clusters = sorted(selected_clusters)
     
-    print(f"\n=== DEBUG: Mapping Verification ===")
-    print(f"Sorted tree clusters: {sorted_tree_clusters}")
-    print(f"Unique labels: {unique_labels}")
-    
     for final_label in unique_labels:
         label_to_tree[final_label] = sorted_tree_clusters[final_label]
-        print(f"  Label {final_label} -> Tree cluster {sorted_tree_clusters[final_label]}")
     
-    # Create palette in tree cluster order (required by plot function)
+    # Build palette in tree cluster order (required by condensed_tree_.plot)
     palette_by_tree_order = []
-    
-    print(f"\n=== DEBUG: Color Mapping ===")
     for idx, tree_cluster in enumerate(sorted_tree_clusters):
-        # Find which final label corresponds to this tree cluster
         final_label = list(label_to_tree.keys())[list(label_to_tree.values()).index(tree_cluster)]
         color = cluster_colors_by_index[final_label]
         palette_by_tree_order.append(color)
-        print(f"  Tree position {idx}: tree_id={tree_cluster} -> label={final_label} -> color={color}")
-    
-    # CRITICAL CHECK: Compare the two lists
-    print(f"\n=== DEBUG: Comparison ===")
-    print(f"Original colors (by label index): {cluster_colors_by_index[:len(unique_labels)]}")
-    print(f"Reordered colors (by tree order):  {palette_by_tree_order}")
-    print(f"Are they the same? {cluster_colors_by_index[:len(unique_labels)] == palette_by_tree_order}")
-    
-    # Print summary
-    print(f"\nCluster color mapping:")
-    for label in unique_labels:
-        point_count = np.sum(final_labels == label)
-        tree_cluster = label_to_tree[label]
-        color = cluster_colors_by_index[label]
-        percentage = 100 * point_count / len(final_labels)
-        print(f"  Cluster {label}: {point_count:,} points ({percentage:.1f}%) | "
-              f"Tree ID {tree_cluster} | Color {color}")
-    
-    # Show noise if present
-    noise_count = np.sum(final_labels == -1)
-    if noise_count > 0:
-        noise_percentage = 100 * noise_count / len(final_labels)
-        print(f"  Noise (-1): {noise_count:,} points ({noise_percentage:.1f}%)")
     
     # Plot with correct color mapping
     ax = model.condensed_tree_.plot(select_clusters=True, selection_palette=palette_by_tree_order)

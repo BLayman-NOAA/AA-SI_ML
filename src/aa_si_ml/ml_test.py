@@ -1,29 +1,30 @@
 import numpy as np
-import xarray as xr 
-from aa_si_ml.ml import *
+import xarray as xr
+from aa_si_ml.ml import (
+    add_valid_data_mask,
+    create_ml_index_coordinate,
+    extract_ml_data_flattened,
+    extract_ml_data_gridded,
+    extract_valid_samples_for_sklearn,
+    normalize_data,
+    reshape_data_for_ml,
+    store_ml_results_flattened,
+)
 
 
 def create_mock_echodata(ping_time_size=100, range_sample_size=50, n_channels=4, add_nans=True, add_artifacts=True):
-    """
-    Create mock echodata with same structure as real data for testing.
-    
-    Parameters:
-    -----------
-    ping_time_size : int
-        Number of ping times
-    range_sample_size : int  
-        Number of range samples
-    n_channels : int
-        Number of frequency channels
-    add_nans : bool
-        Whether to add some NaN values
-    add_artifacts : bool
-        Whether to add extreme values (artifacts)
-        
+    """Create mock echodata with same structure as real data for testing.
+
+    Args:
+        ping_time_size (int): Number of ping times. Defaults to 100.
+        range_sample_size (int): Number of range samples. Defaults to 50.
+        n_channels (int): Number of frequency channels. Defaults to 4.
+        add_nans (bool): Whether to add some NaN values. Defaults to True.
+        add_artifacts (bool): Whether to add extreme values (artifacts).
+            Defaults to True.
+
     Returns:
-    --------
-    ds_mock : xarray.Dataset
-        Mock dataset with Sv data
+        xr.Dataset: Mock dataset with Sv data.
     """
     import pandas as pd
     
@@ -90,16 +91,14 @@ def create_mock_echodata(ping_time_size=100, range_sample_size=50, n_channels=4,
 # Test Functions
 
 def test_ml_index_tracking():
-    """
-    Test that grid indices correctly track data points through transformations.
-    """
+    """Test that grid indices correctly track data points through transformations."""
     print("="*60)
     print("TESTING GRID INDEX TRACKING")
     print("="*60)
     
-    # Create small mock dataset for easy verification - NOW WITH NaNs
+    # Create small mock dataset for easy verification
     ds_mock = create_mock_echodata(ping_time_size=5, range_sample_size=7, n_channels=4, 
-                                  add_nans=True, add_artifacts=True)  # Enable NaNs and artifacts
+                                  add_nans=True, add_artifacts=True)
     
     print(f"\nOriginal data shape: {ds_mock['Sv'].shape} (channel, ping_time, range_sample)")
     print(f"Original data (first channel):")
@@ -154,9 +153,7 @@ def test_ml_index_tracking():
 
 
 def test_nan_filtering_specifically():
-    """
-    Dedicated test for NaN filtering functionality.
-    """
+    """Dedicated test for NaN filtering functionality."""
     print("="*60)
     print("TESTING NaN FILTERING SPECIFICALLY")
     print("="*60)
@@ -203,9 +200,7 @@ def test_nan_filtering_specifically():
 
 
 def test_filtering_and_masking():
-    """
-    Test that filtering correctly removes NaNs and artifacts.
-    """
+    """Test that filtering correctly removes NaNs and artifacts."""
     print("="*60)
     print("TESTING FILTERING AND MASKING")
     print("="*60)
@@ -242,12 +237,13 @@ def test_filtering_and_masking():
 
 
 def test_regridding_accuracy():
-    """
-    Test that regridding accurately places results back in original grid positions.
-    Now tests both single-dimensional results (clusters) and multi-dimensional data (normalized ML data).
+    """Test that regridding accurately places results back in original grid positions.
+
+    Tests both single-dimensional results (clusters) and multi-dimensional
+    data (normalized ML data).
     """
     print("="*60)
-    print("TESTING REGRIDDING ACCURACY 2")
+    print("TESTING REGRIDDING ACCURACY")
     print("="*60)
     
     # Create simple mock data
@@ -261,7 +257,6 @@ def test_regridding_accuracy():
     ds_normalized = normalize_data(ds_ml_ready, method='standard', dataset_name='ml_data_clean')
     
     print("\n3. EXTRACTING FOR SKLEARN...")
-    # UPDATED CALL
     X, grid_indices, _ = extract_valid_samples_for_sklearn(ds_normalized, specific_data_name='standard_normalized', dataset_name='ml_data_clean')
     
     print(f"Original grid shape: {ds_mock['Sv'].shape}")
@@ -330,33 +325,22 @@ def test_regridding_accuracy():
 
 
 def test_full_ml_pipeline():
-    """
-    Test the complete ML pipeline end-to-end.
-    """
+    """Test the complete ML pipeline end-to-end."""
     print("="*60)
     print("TESTING FULL ML PIPELINE")
     print("="*60)
     
     # Create realistic mock dataset
     ds_mock = create_mock_echodata(ping_time_size=5, range_sample_size=7, n_channels=4)
-    
-    print("\n\n\nds_mock", ds_mock)
 
     print("\n1. PREPARING ML DATA (with integrated masking)...")
     ds_ml_ready = reshape_data_for_ml(ds_mock)
 
-    print("\n\n\nds_ml_ready", ds_ml_ready)
-
     print("\n2. NORMALIZING DATA...")
     ds_normalized = normalize_data(ds_ml_ready, method='standard', dataset_name='ml_data_clean')
 
-    print("\n\n\nds_normalized", ds_normalized)
-
     print("\n3. EXTRACTING FOR SKLEARN...")
-    # UPDATED CALL
     X, _, _ = extract_valid_samples_for_sklearn(ds_normalized, specific_data_name='standard_normalized', dataset_name='ml_data_clean')
-    
-    print("\n\n\nX", X)
 
     print("\n4. RUNNING MOCK ML ALGORITHM...")
     # Simulate a simple clustering algorithm
@@ -365,8 +349,6 @@ def test_full_ml_pipeline():
     cluster_labels = kmeans.fit_predict(X)
     
     print(f"Cluster distribution: {np.unique(cluster_labels, return_counts=True)}")
-    
-    print("\n\n\ncluster_labels", cluster_labels)
 
     print("\n5. REGRIDDING RESULTS...")
 
@@ -376,9 +358,6 @@ def test_full_ml_pipeline():
     # Then create gridded version and store it (now needs dataset_name parameter)
     gridded_results = extract_ml_data_gridded(ds_final, 'kmeans_clusters', dataset_name='ml_data_clean', 
                                                 fill_value=-1, store_in_dataset=True)
-
-    print("\n\n\nds_final", ds_final)
-    print("\n\n\ngridded_results", gridded_results)
 
     print("\n6. PIPELINE VERIFICATION...")
     print(f"Final dataset variables: {list(ds_final.data_vars.keys())}")
@@ -403,10 +382,8 @@ def test_full_ml_pipeline():
 
 
 def run_all_tests():
-    """
-    Run all test functions in sequence.
-    """
-    print("STARTING ML PIPELINE TESTS 3")
+    """Run all test functions in sequence."""
+    print("STARTING ML PIPELINE TESTS")
     print("="*80)
     
     try:
@@ -428,23 +405,6 @@ def run_all_tests():
         print("\n" + "="*80)
         print("ALL TESTS COMPLETED SUCCESSFULLY!")
         print("="*80)
-        return ds4
-        
-    except Exception as e:
-        print(f"\n❌ TEST FAILED: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return None
-        return ds4
-        
-    except Exception as e:
-        print(f"\n❌ TEST FAILED: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return None
-        import traceback
-        traceback.print_exc()
-        return None
         return ds4
         
     except Exception as e:
