@@ -163,7 +163,6 @@ def get_grid_coordinates(ds_Sv, data_var):
     return grid_coords
 
 
-# called by reshape_data_for_ml
 def add_valid_data_mask(ds_Sv, remove_nan=True, mask_invalid_values=True, mask_name='valid_mask', custom_mask_name=None, data_var='Sv'):
     """Add a boolean validity mask identifying clean data points for ML.
 
@@ -227,7 +226,6 @@ def add_valid_data_mask(ds_Sv, remove_nan=True, mask_invalid_values=True, mask_n
     return ds_with_mask
 
 
-# called by reshape_data_for_ml
 def create_ml_index_coordinate(ds_with_mask, data_var='Sv', dataset_name='ml_data_clean'):
     """Assign a unique integer index to every grid cell.
 
@@ -270,7 +268,6 @@ def create_ml_index_coordinate(ds_with_mask, data_var='Sv', dataset_name='ml_dat
     return ds_with_index
 
 
-# called by reshape_data_for_ml
 def extract_ml_data_flattened(ds_ml_ready, data_var='Sv', mask_name='valid_mask', 
                             dataset_name='ml_data_clean', feature_strategy='channels', 
                             baseline_channel=2, **feature_kwargs):
@@ -288,12 +285,12 @@ def extract_ml_data_flattened(ds_ml_ready, data_var='Sv', mask_name='valid_mask'
         dataset_name (str): Base name used for coordinate naming.
             Defaults to 'ml_data_clean'.
         feature_strategy (str): How to construct features from channels.
-            ``'channels'`` -- raw channel values (default).
-            ``'baseline_plus_differences'`` -- one baseline channel plus
+            'channels': raw channel values (default).
+            'baseline_plus_differences': one baseline channel plus
             differences of the remaining channels from the baseline.
-            ``'mean_centered'`` -- per-sample mean Sv plus each channel
-            centred around that mean (captures intensity and spectral shape).
-            ``'custom'`` -- user-provided function via *feature_kwargs*.
+            'mean_centered': per-sample mean Sv plus each channel centered
+            around that mean (captures intensity and spectral shape).
+            'custom': user-provided function via feature_kwargs.
         baseline_channel (int): Channel index used as the baseline when
             *feature_strategy* is ``'baseline_plus_differences'``.
             Defaults to 2.
@@ -414,7 +411,6 @@ def extract_ml_data_flattened(ds_ml_ready, data_var='Sv', mask_name='valid_mask'
     return ml_data_flat, grid_indices
 
 
-# called by reshape_data_for_ml and normalize_data
 def store_ml_data_flattened(ds_ml_ready, ml_data_flat, grid_indices, dataset_name):
     """Store flattened ML data in the dataset with a universal index mapping.
 
@@ -551,7 +547,6 @@ def reshape_data_for_ml(ds_Sv, data_var='Sv_corrected', dataset_name='ml_data_cl
     print(f"Preparing ML data from '{sv_var}' as '{dataset_name}'...")
     print(f"Data shape: {ds_ml_ready[sv_var].shape}")
     
-    # Extract and store using v2 (universal mapping)
     ml_data_flat, grid_indices = extract_ml_data_flattened(
         ds_ml_ready, sv_var, mask_name=mask_name, dataset_name=dataset_name,
         feature_strategy=feature_strategy, baseline_channel=baseline_channel, **feature_kwargs
@@ -572,39 +567,29 @@ def normalize_data(ds_ml_ready, method='standard', pre_L2_method='standard',
     normalization with a configurable pre-scaler, power-transform
     flattening, UMAP embedding, and feature weighting.
 
-    Parameters
-    ----------
-    ds_ml_ready : xr.Dataset
-        Dataset produced by :func:`reshape_data_for_ml`.
-    method : str, optional
-        Normalization method.  One of ``'standard'``, ``'robust'``,
-        ``'minmax'``, ``'flatten'``, ``'power'``, ``'quantile'``,
-        ``'umap'``, ``'flatten_plus_umap'``, or ``'l2'``
-        (default ``'standard'``).
-    pre_L2_method : str, optional
-        Scaler applied before L2 normalization when *method* is ``'l2'``
-        (default ``'standard'``).
-    shift_positive : bool, optional
-        Shift all values to be positive after normalization
-        (default ``False``).
-    per_feature : bool, optional
-        Normalize each feature independently (default ``True``).
-    dataset_name : str, optional
-        Base dataset name (default ``'ml_data_clean'``).
-    normalization_name : str or None, optional
-        Suffix for the stored result.  Defaults to *method* name.
-    feature_weights : array-like or None, optional
-        Per-feature multiplicative weights (default ``None``).
-    n_quantiles : int, optional
-        Number of quantiles for ``'quantile'`` method (default ``100``).
-    flatten_weight : float, optional
-        Blending weight for ``'flatten'`` method’s CDF transform
-        (default ``1``).
+    Args:
+        ds_ml_ready (xr.Dataset): Dataset produced by reshape_data_for_ml.
+        method (str): Normalization method. One of 'standard', 'robust',
+            'minmax', 'flatten', 'power', 'quantile', 'umap',
+            'flatten_plus_umap', or 'l2'. Defaults to 'standard'.
+        pre_L2_method (str): Scaler applied before L2 normalization when
+            method is 'l2'. Defaults to 'standard'.
+        shift_positive (bool): Shift all values to be positive after
+            normalization. Defaults to False.
+        per_feature (bool): Normalize each feature independently.
+            Defaults to True.
+        dataset_name (str): Base dataset name. Defaults to 'ml_data_clean'.
+        normalization_name (str or None): Suffix for the stored result.
+            Defaults to the method name.
+        feature_weights (array-like or None): Per-feature multiplicative
+            weights. Defaults to None.
+        n_quantiles (int): Number of quantiles for 'quantile' method.
+            Defaults to 100.
+        flatten_weight (float): Blending weight for 'flatten' method's CDF transform.
 
-    Returns
-    -------
-    ds_ml_ready : xr.Dataset
-        Dataset with the normalized data added.
+
+    Returns:
+        xr.Dataset: Dataset with the normalized data added.
     """
     # Set default normalization_name based on method
     if normalization_name is None:
@@ -912,25 +897,18 @@ def extract_valid_samples_for_sklearn(ds_ml_ready, specific_data_name=None, data
 def store_ml_results_flattened(ds_ml_ready, flat_results, specific_data_name, dataset_name='ml_data_clean', result_sample_indices=None):
     """Store 1-D ML results aligned to the flattened sample index.
 
-    Parameters
-    ----------
-    ds_ml_ready : xr.Dataset
-        Dataset with the sample-index-to-grid-index mapping.
-    flat_results : np.ndarray
-        1-D array of ML results (e.g. cluster labels).
-    specific_data_name : str
-        Suffix used for the stored variable name.
-    dataset_name : str, optional
-        Base dataset name (default ``'ml_data_clean'``).
-    result_sample_indices : np.ndarray or None, optional
-        Sample indices corresponding to *flat_results*.  Must be a
-        subset of the dataset’s sample indices.  If ``None``, assumes
-        all samples are present (default ``None``).
+    Args:
+        ds_ml_ready (xr.Dataset): Dataset with the sample-index-to-grid-index mapping.
+        flat_results (np.ndarray): 1-D array of ML results (e.g. cluster labels).
+        specific_data_name (str): Suffix used for the stored variable name.
+        dataset_name (str): Base dataset name. Defaults to 'ml_data_clean'.
+        result_sample_indices (np.ndarray or None): Sample indices corresponding to
+            flat_results. Must be a subset of the dataset's sample indices.
+            If None, assumes all samples are present. Defaults to None.
 
-    Returns
-    -------
-    ds_ml_ready : xr.Dataset
-        Dataset with the results added.
+
+    Returns:
+        xr.Dataset: Dataset with the results added.
     """
 
     mapping_name = f'{dataset_name}_sample_index_to_grid_index'
@@ -1163,12 +1141,12 @@ def apply_dbscan_clustering(
     else:
         print(f"Using ALL {len(X_normalized):,} valid data points for {'HDBSCAN' if useHDBScan else 'DBSCAN'} clustering")
         X_sample = X_normalized
-        used_sample_indices = sample_indices  # Track the indices we're using
+        used_sample_indices = sample_indices
     
     results = {}
     
     if useHDBScan:
-        print("\n=== HDBSCAN CLUSTERING RESULTS ===")
+        print("HDBSCAN clustering results:")
         if calculate_silhouette and len(X_sample) > silhouette_sample_size:
             print(f"Note: Silhouette scores calculated on sample of {silhouette_sample_size:,} points for efficiency")
         
@@ -1229,7 +1207,7 @@ def apply_dbscan_clustering(
     
     else:
         # Standard DBSCAN: Loop through eps and min_samples
-        print("\n=== DBSCAN CLUSTERING RESULTS ===")
+        print("DBSCAN clustering results:")
         if calculate_silhouette and len(X_sample) > silhouette_sample_size:
             print(f"Note: Silhouette scores calculated on sample of {silhouette_sample_size:,} points for efficiency")
         
@@ -1398,7 +1376,6 @@ def print_basic_cluster_stats(cluster_labels, n_clusters, n_noise, sil_score, ca
         print(f"  Cluster sizes: {cluster_sizes}")
 
 
-# kmeans clustering
 def apply_kmeans_clustering(X_normalized, sample_indices, k_values=[3, 5, 7], sample_size=None, 
                            calculate_silhouette=True, silhouette_sample_size=10000):
     """Run K-means clustering for each value of *k*.
@@ -1428,16 +1405,15 @@ def apply_kmeans_clustering(X_normalized, sample_indices, k_values=[3, 5, 7], sa
         subsample_mask = np.random.choice(len(X_normalized), size=sample_size, replace=False)
         X_sample = X_normalized[subsample_mask]
         used_sample_indices = sample_indices[subsample_mask]  # Get corresponding indices
-    # Use all data or subsample
     else:
         print(f"Using ALL {len(X_normalized):,} valid data points for clustering")
         X_sample = X_normalized
-        used_sample_indices = sample_indices  # Track the indices we're using
+        used_sample_indices = sample_indices
         
     
     results = {}
     
-    print("\n=== K-MEANS CLUSTERING RESULTS ===")
+    print("K-means clustering results:")
     if calculate_silhouette and len(X_sample) > silhouette_sample_size:
         print(f"Note: Silhouette scores calculated on sample of {silhouette_sample_size:,} points for efficiency")
     

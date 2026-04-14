@@ -29,7 +29,7 @@ def create_mock_echodata(ping_time_size=100, range_sample_size=50, n_channels=4,
     import pandas as pd
     
     # Create coordinates
-    ping_time = pd.date_range('2023-01-01', periods=ping_time_size, freq='1s')  # Use lowercase 's'
+    ping_time = pd.date_range('2023-01-01', periods=ping_time_size, freq='1s')
     range_sample = np.arange(range_sample_size)
     channel = [f'freq_{i}' for i in range(n_channels)]
     
@@ -92,9 +92,7 @@ def create_mock_echodata(ping_time_size=100, range_sample_size=50, n_channels=4,
 
 def test_ml_index_tracking():
     """Test that grid indices correctly track data points through transformations."""
-    print("="*60)
-    print("TESTING GRID INDEX TRACKING")
-    print("="*60)
+    print("Testing grid index tracking")
     
     # Create small mock dataset for easy verification
     ds_mock = create_mock_echodata(ping_time_size=5, range_sample_size=7, n_channels=4, 
@@ -154,9 +152,7 @@ def test_ml_index_tracking():
 
 def test_nan_filtering_specifically():
     """Dedicated test for NaN filtering functionality."""
-    print("="*60)
-    print("TESTING NaN FILTERING SPECIFICALLY")
-    print("="*60)
+    print("Testing NaN filtering")
     
     # Create data with known NaN pattern
     ds_mock = create_mock_echodata(ping_time_size=5, range_sample_size=7, n_channels=4,
@@ -201,9 +197,7 @@ def test_nan_filtering_specifically():
 
 def test_filtering_and_masking():
     """Test that filtering correctly removes NaNs and artifacts."""
-    print("="*60)
-    print("TESTING FILTERING AND MASKING")
-    print("="*60)
+    print("Testing filtering and masking")
     
     # Create mock data with known NaNs and artifacts
     ds_mock = create_mock_echodata(ping_time_size=5, range_sample_size=7, n_channels=4,
@@ -242,9 +236,7 @@ def test_regridding_accuracy():
     Tests both single-dimensional results (clusters) and multi-dimensional
     data (normalized ML data).
     """
-    print("="*60)
-    print("TESTING REGRIDDING ACCURACY")
-    print("="*60)
+    print("Testing regridding accuracy")
     
     # Create simple mock data
     ds_mock = create_mock_echodata(ping_time_size=5, range_sample_size=7, n_channels=4,
@@ -326,9 +318,7 @@ def test_regridding_accuracy():
 
 def test_full_ml_pipeline():
     """Test the complete ML pipeline end-to-end."""
-    print("="*60)
-    print("TESTING FULL ML PIPELINE")
-    print("="*60)
+    print("Testing full ML pipeline")
     
     # Create realistic mock dataset
     ds_mock = create_mock_echodata(ping_time_size=5, range_sample_size=7, n_channels=4)
@@ -383,32 +373,29 @@ def test_full_ml_pipeline():
 
 def run_all_tests():
     """Run all test functions in sequence."""
-    print("STARTING ML PIPELINE TESTS")
-    print("="*80)
+    print("Starting ML pipeline tests")
     
     try:
         print("\nTest 1: Grid Index Tracking")
         ds1, data1, indices1 = test_ml_index_tracking()
-        print("✓ PASSED")
+        print("PASSED")
         print("\nTest 1.5: NaN Filtering Specifically")
         ds1_5 = test_nan_filtering_specifically()
-        print("✓ PASSED")
+        print("PASSED")
         print("\nTest 2: Filtering and Masking") 
         ds2 = test_filtering_and_masking()
-        print("✓ PASSED")
+        print("PASSED")
         print("\nTest 3: Regridding Accuracy")
         ds3 = test_regridding_accuracy()
-        print("✓ PASSED")
+        print("PASSED")
         print("\nTest 4: Full ML Pipeline")
         ds4 = test_full_ml_pipeline()
-        print("✓ PASSED")
-        print("\n" + "="*80)
-        print("ALL TESTS COMPLETED SUCCESSFULLY!")
-        print("="*80)
+        print("PASSED")
+        print("\nAll tests completed successfully.")
         return ds4
         
     except Exception as e:
-        print(f"\n❌ TEST FAILED: {str(e)}")
+        print(f"\nFAILED: {str(e)}")
         import traceback
         traceback.print_exc()
         return None
