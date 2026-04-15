@@ -1169,23 +1169,24 @@ def apply_dbscan_clustering(
             
             # Get number of clusters (excluding noise points labeled as -1)
             n_clusters = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
-            n_noise = list(cluster_labels).count(-1)
+            n_noise = int(np.sum(cluster_labels == -1))
             
             # Calculate silhouette score with sampling for efficiency
             sil_score = _calculate_silhouette(X_sample, cluster_labels, n_clusters, calculate_silhouette, silhouette_sample_size)
 
-            print("Before noise reassignment:")
-            print_basic_cluster_stats(cluster_labels, n_clusters, n_noise, sil_score, calculate_silhouette)
-
             if soft_membership_threshold is not None:
+                print("Before noise reassignment:")
+                print_basic_cluster_stats(cluster_labels, n_clusters, n_noise, sil_score, calculate_silhouette)
+
                 cluster_labels = assign_noise_by_soft_membership(model, threshold=soft_membership_threshold)
 
-            print("After noise reassignment:")
+                n_clusters = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
+                n_noise = int(np.sum(cluster_labels == -1))
+                sil_score = _calculate_silhouette(X_sample, cluster_labels, n_clusters, calculate_silhouette, silhouette_sample_size)
 
-            n_clusters = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
-            n_noise = list(cluster_labels).count(-1)
-            # Calculate silhouette score with sampling for efficiency
-            sil_score = _calculate_silhouette(X_sample, cluster_labels, n_clusters, calculate_silhouette, silhouette_sample_size)
+                print("After noise reassignment:")
+
+            # Show cluster statistics
             print_basic_cluster_stats(cluster_labels, n_clusters, n_noise, sil_score, calculate_silhouette)
 
             # Store results
@@ -1201,9 +1202,6 @@ def apply_dbscan_clustering(
                 'min_cluster_size': min_cluster_size,
                 'metric': metric,
             }
-            
-            # Show cluster statistics
-            print_basic_cluster_stats(cluster_labels, n_clusters, n_noise, sil_score, calculate_silhouette)
     
     else:
         # Standard DBSCAN: Loop through eps and min_samples
@@ -1230,7 +1228,7 @@ def apply_dbscan_clustering(
                 
                 # Get number of clusters (excluding noise points labeled as -1)
                 n_clusters = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
-                n_noise = list(cluster_labels).count(-1)
+                n_noise = int(np.sum(cluster_labels == -1))
                 
                 # Calculate silhouette score with sampling for efficiency
                 sil_score = _calculate_silhouette(X_sample, cluster_labels, n_clusters, calculate_silhouette, silhouette_sample_size)
