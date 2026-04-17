@@ -17,12 +17,9 @@ except PackageNotFoundError:
 
 from .ml import (
     add_cluster_label_mask,
+    add_cluster_mask,
     add_largest_cluster_mask,
     add_valid_data_mask,
-    apply_dbscan_clustering,
-    apply_kmeans_clustering,
-    apply_min_cluster_size_filter,
-    assign_noise_by_soft_membership,
     compute_mvbs,
     create_ml_index_coordinate,
     data_preprocessing_pipeline,
@@ -34,22 +31,33 @@ from .ml import (
     full_dbscan_iteration,
     get_grid_coordinates,
     normalize_data,
+    remove_noise,
+    reshape_and_normalize_data,
+    reshape_data_for_ml,
+    store_ml_data_flattened,
+    store_ml_results_flattened,
+)
+
+from .ml_algorithms import (
+    apply_dbscan_clustering,
+    apply_kmeans_clustering,
+    apply_min_cluster_size_filter,
+    assign_noise_by_soft_membership,
+    retrieve_background_cluster,
+)
+
+from .plotting_and_logging import (
     plot_cluster_statistics,
     plot_dbscan_cluster_hierarchy,
     print_basic_cluster_stats,
     print_cluster_statistics,
-    remove_noise,
-    reshape_and_normalize_data,
-    reshape_data_for_ml,
-    retrieve_background_cluster,
-    store_ml_data_flattened,
-    store_ml_results_flattened,
     visualize_normalized_data_histogram,
 )
 
 __all__ = [
     "__version__",
     "add_cluster_label_mask",
+    "add_cluster_mask",
     "add_largest_cluster_mask",
     "add_valid_data_mask",
     "apply_dbscan_clustering",

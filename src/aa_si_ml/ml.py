@@ -1,126 +1,128 @@
-import time
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: NOAA Fisheries
+
+import logging
 
 import numpy as np
 import xarray as xr
-import matplotlib.pyplot as plt
-from matplotlib.patches import Patch
-from matplotlib.lines import Line2D
 from sklearn.preprocessing import (
     StandardScaler, RobustScaler, MinMaxScaler,
     Normalizer, PowerTransformer, QuantileTransformer,
 )
-from sklearn.cluster import KMeans, DBSCAN
-from sklearn.metrics import silhouette_score
 from scipy.stats import norm
-import hdbscan
 import umap
 import echopype as ep
 from aa_si_visualization import echogram
 from aa_si_utils import utils
 
+from .constants import DEFAULT_CLUSTER_COLORS, SV_MIN_VALID, SV_MAX_VALID
+from .ml_algorithms import (
+    apply_dbscan_clustering,
+    apply_kmeans_clustering,
+    apply_min_cluster_size_filter,
+    assign_noise_by_soft_membership,
+    _calculate_silhouette,
+    retrieve_background_cluster,
+)
+from .plotting_and_logging import (
+    visualize_normalized_data_histogram,
+    plot_cluster_statistics,
+    plot_dbscan_cluster_hierarchy,
+    print_basic_cluster_stats,
+    print_cluster_statistics,
+)
+
+logger = logging.getLogger(__name__)
 
 
-def add_largest_cluster_mask(ds_Sv, cluster_labels_gridded, use_corrected=True, mask_name='largest_cluster_mask'):
-    """Create a mask that excludes the largest cluster from the dataset.
 
-    Identifies the cluster with the most points (ignoring noise label -1)
-    and produces a boolean mask where those points are ``False``.
+def add_cluster_mask(ds_Sv, cluster_labels_gridded, cluster_label=None,
+                     use_corrected=True, mask_name='cluster_mask'):
+    """Create a mask that excludes a cluster from the dataset.
+
+    When cluster_label is None the largest cluster is identified and
+    excluded. Pass an explicit integer label to exclude a specific cluster.
 
     Args:
         ds_Sv (xr.Dataset): Dataset containing Sv data.
         cluster_labels_gridded (xr.DataArray): 2-D gridded cluster labels
             (ping_time x range_sample).
-        use_corrected (bool): Use ``Sv_corrected`` when available.
+        cluster_label (int or None): Cluster label to exclude. When None
+            the largest cluster (by point count) is used. Defaults to None.
+        use_corrected (bool): Use Sv_corrected when available.
             Defaults to True.
         mask_name (str): Name for the stored mask variable.
-            Defaults to 'largest_cluster_mask'.
+            Defaults to 'cluster_mask'.
 
     Returns:
         xr.Dataset: Input dataset with the mask added as a new variable.
     """
-    ds_with_mask = ds_Sv
-
     sv_var = 'Sv_corrected' if use_corrected and 'Sv_corrected' in ds_Sv else 'Sv'
     sv_data = ds_Sv[sv_var]
 
+    if cluster_label is None:
+        unique_labels, counts = np.unique(cluster_labels_gridded, return_counts=True)
+        valid = unique_labels >= 0
+        valid_labels = unique_labels[valid]
+        valid_counts = counts[valid]
+        if len(valid_labels) == 0:
+            logger.warning("No valid clusters found (all points are noise)")
+            ds_Sv[mask_name] = xr.zeros_like(sv_data, dtype=bool)
+            return ds_Sv
+        cluster_label = int(valid_labels[np.argmax(valid_counts)])
+        logger.info("Largest cluster: label %d with %s points", cluster_label,
+                    f"{int(valid_counts[np.argmax(valid_counts)]):,}")
+
+    cluster_2d_mask = cluster_labels_gridded == cluster_label
+    logger.info("Masking cluster %d with %s points", cluster_label,
+                f"{int(cluster_2d_mask.sum().values):,}")
+
     valid_mask = xr.ones_like(sv_data, dtype=bool)
+    final_mask = valid_mask & ~cluster_2d_mask.broadcast_like(sv_data)
 
-    unique_labels, counts = np.unique(cluster_labels_gridded, return_counts=True)
+    ds_Sv[mask_name] = final_mask
+    ds_Sv[mask_name].attrs['long_name'] = f'Valid data mask excluding cluster {cluster_label}'
+    ds_Sv[mask_name].attrs['description'] = f'Mask that excludes cluster label {cluster_label}'
+    ds_Sv[mask_name].attrs['source_variable'] = cluster_labels_gridded
 
-    valid_label_mask = unique_labels >= 0
-    valid_labels = unique_labels[valid_label_mask]
-    valid_counts = counts[valid_label_mask]
-    
-    if len(valid_labels) == 0:
-        print("No valid clusters found (all points are noise)")
-        largest_cluster_label = -1
-        largest_cluster_size = 0
-    else:
-        # Find the label with maximum count
-        max_count_idx = np.argmax(valid_counts)
-        largest_cluster_label = valid_labels[max_count_idx]
-        largest_cluster_size = valid_counts[max_count_idx]
-    
-    print(f"Largest cluster: label {largest_cluster_label} with {largest_cluster_size:,} points")
-
-    if largest_cluster_label >= 0:
-        largest_cluster_2d_mask = cluster_labels_gridded == largest_cluster_label
-        largest_cluster_mask = largest_cluster_2d_mask.broadcast_like(sv_data)
-        largest_cluster_mask = valid_mask & ~largest_cluster_mask
-    else:
-        largest_cluster_mask = xr.zeros_like(sv_data, dtype=bool)
-
-    n_excluded = largest_cluster_mask.sum().values
-    print(f"Masked {n_excluded:,} values")
-
-    ds_with_mask[mask_name] = largest_cluster_mask
-    ds_with_mask[mask_name].attrs['long_name'] = 'Valid data mask of largest cluster'
-    ds_with_mask[mask_name].attrs['description'] = 'Mask excluding all data points in the largest cluster'
-    ds_with_mask[mask_name].attrs['source_variable'] = cluster_labels_gridded
-
-    return ds_with_mask
+    return ds_Sv
 
 
-def add_cluster_label_mask(ds_Sv, cluster_labels_gridded, cluster_label, use_corrected=True, mask_name='cluster_mask'):
-    """Create a mask that excludes a specific cluster label from the dataset.
-
-    Unlike ``add_largest_cluster_mask`` which always picks the largest, this
-    lets you specify exactly which cluster label to mask out (e.g. a background
-    cluster identified by ``retrieve_background_cluster``).
+def add_largest_cluster_mask(ds_Sv, cluster_labels_gridded, use_corrected=True,
+                             mask_name='largest_cluster_mask'):
+    """Create a mask excluding the largest cluster. Wraps add_cluster_mask.
 
     Args:
-        ds_Sv (xr.Dataset): The dataset to add the mask to.
-        cluster_labels_gridded (xr.DataArray): 2-D gridded cluster labels
-            (ping_time x range_sample).
+        ds_Sv (xr.Dataset): Dataset containing Sv data.
+        cluster_labels_gridded (xr.DataArray): 2-D gridded cluster labels.
+        use_corrected (bool): Use Sv_corrected when available. Defaults to True.
+        mask_name (str): Name for the stored mask variable.
+            Defaults to 'largest_cluster_mask'.
+
+    Returns:
+        xr.Dataset: Input dataset with the mask added.
+    """
+    return add_cluster_mask(ds_Sv, cluster_labels_gridded, cluster_label=None,
+                            use_corrected=use_corrected, mask_name=mask_name)
+
+
+def add_cluster_label_mask(ds_Sv, cluster_labels_gridded, cluster_label,
+                           use_corrected=True, mask_name='cluster_mask'):
+    """Create a mask excluding a specific cluster label. Wraps add_cluster_mask.
+
+    Args:
+        ds_Sv (xr.Dataset): Dataset containing Sv data.
+        cluster_labels_gridded (xr.DataArray): 2-D gridded cluster labels.
         cluster_label (int): The specific cluster label to mask out.
-        use_corrected (bool): Use ``Sv_corrected`` for determining shape.
-            Defaults to True.
+        use_corrected (bool): Use Sv_corrected when available. Defaults to True.
         mask_name (str): Name for the stored mask variable.
             Defaults to 'cluster_mask'.
 
     Returns:
         xr.Dataset: Dataset with the mask added.
     """
-    ds_with_mask = ds_Sv
-    sv_var = 'Sv_corrected' if use_corrected and 'Sv_corrected' in ds_Sv else 'Sv'
-    sv_data = ds_Sv[sv_var]
-    valid_mask = xr.ones_like(sv_data, dtype=bool)
-
-    cluster_2d_mask = cluster_labels_gridded == cluster_label
-    cluster_count = int(cluster_2d_mask.sum().values)
-    print(f"Masking cluster {cluster_label} with {cluster_count:,} points")
-
-    cluster_broadcast = cluster_2d_mask.broadcast_like(sv_data)
-    final_mask = valid_mask & ~cluster_broadcast
-
-    n_excluded = final_mask.sum().values
-    print(f"Masked {n_excluded:,} NaN values")
-
-    ds_with_mask[mask_name] = final_mask
-    ds_with_mask[mask_name].attrs['long_name'] = f'Valid data mask excluding cluster {cluster_label}'
-    ds_with_mask[mask_name].attrs['description'] = f'Mask that excludes cluster label {cluster_label}'
-
-    return ds_with_mask
+    return add_cluster_mask(ds_Sv, cluster_labels_gridded, cluster_label=cluster_label,
+                            use_corrected=use_corrected, mask_name=mask_name)
 
 
 def get_grid_coordinates(ds_Sv, data_var):
@@ -155,11 +157,9 @@ def get_grid_coordinates(ds_Sv, data_var):
     
     preferred_first_dims = ['time', 'ping_time', 'distance']
     if grid_coords[0] not in preferred_first_dims:
-        # Swap coordinates to put time/distance dimension first
         grid_coords = [grid_coords[1], grid_coords[0]]
-        print(f"  Swapped coordinate order to: {grid_coords}")
-    
-    
+        logger.debug("Swapped coordinate order to: %s", grid_coords)
+
     return grid_coords
 
 
@@ -188,9 +188,7 @@ def add_valid_data_mask(ds_Sv, remove_nan=True, mask_invalid_values=True, mask_n
     ds_with_mask = ds_Sv
 
     sv_var = data_var
-    print(f"Analyzing '{sv_var}' for validity")
-    print(f"Data shape: {ds_Sv[sv_var].shape}")
-    print(f"Channels (frequencies): {len(ds_Sv['channel'])}")
+    logger.info("Analyzing '%s' for validity (shape %s)", sv_var, ds_Sv[sv_var].shape)
 
     sv_data = ds_Sv[sv_var]
     valid_mask = xr.ones_like(sv_data, dtype=bool)
@@ -198,25 +196,25 @@ def add_valid_data_mask(ds_Sv, remove_nan=True, mask_invalid_values=True, mask_n
     if remove_nan:
         nan_mask = xr.ufuncs.isnan(sv_data)
         valid_mask = valid_mask & ~nan_mask
-        n_nan = nan_mask.sum().values
-        print(f"Masked {n_nan:,} NaN values")
+        logger.info("Masked %s NaN values", f"{int(nan_mask.sum().values):,}")
 
     if mask_invalid_values:
-        # Typical Sv range is roughly -120 to 20 dB; use conservative bounds
-        too_low_mask = sv_data < -200
-        too_high_mask = sv_data > 50
-        artifact_mask = too_low_mask | too_high_mask
+        artifact_mask = (sv_data < SV_MIN_VALID) | (sv_data > SV_MAX_VALID)
         valid_mask = valid_mask & ~artifact_mask
-        n_artifacts = artifact_mask.sum().values
-        print(f"Masked {n_artifacts:,} extreme values (< -200 or > 50 dB)")
+        logger.info(
+            "Masked %s extreme values (< %d or > %d dB)",
+            f"{int(artifact_mask.sum().values):,}", SV_MIN_VALID, SV_MAX_VALID
+        )
 
     if custom_mask_name is not None:
         custom_mask = ds_Sv[custom_mask_name]
         if custom_mask.shape != sv_data.shape:
             raise ValueError("custom_mask must have the same shape as the Sv data")
         valid_mask = valid_mask & custom_mask
-        n_custom_masked = (~custom_mask).sum().values
-        print(f"Applied custom mask, masking additional {n_custom_masked:,} values")
+        logger.info(
+            "Applied custom mask, masking additional %s values",
+            f"{int((~custom_mask).sum().values):,}"
+        )
     
     ds_with_mask[mask_name] = valid_mask
     ds_with_mask[mask_name].attrs['long_name'] = 'Valid data mask for machine learning'
@@ -244,7 +242,7 @@ def create_ml_index_coordinate(ds_with_mask, data_var='Sv', dataset_name='ml_dat
     """
     ds_with_index = ds_with_mask
     grid_coords = get_grid_coordinates(ds_with_mask, data_var)
-    print(f"Creating grid index coordinate based on {grid_coords}...")
+    logger.info("Creating grid index coordinate based on %s", grid_coords)
 
     coord_1_size = ds_with_mask.sizes[grid_coords[0]]
     coord_2_size = ds_with_mask.sizes[grid_coords[1]]
@@ -399,15 +397,11 @@ def extract_ml_data_flattened(ds_ml_ready, data_var='Sv', mask_name='valid_mask'
         ml_data_flat.attrs['baseline_channel'] = baseline_channel
         ml_data_flat.attrs['baseline_frequency'] = str(data.coords['channel'].values[baseline_channel])
     
-    print(f"Extracted {n_samples:,} valid samples using '{feature_strategy}' strategy")
-    print(f"Shape: {ml_data_flat.shape} (samples, features)")
-    if feature_strategy == 'baseline_plus_differences':
-        print(f"Baseline channel: {baseline_channel} ({data.coords['channel'].values[baseline_channel]})")
-        print(f"Features: 1 baseline + {len(other_channels)} differences")
-    elif feature_strategy == 'mean_centered':
-        print(f"Features: 1 mean + {raw_data_values.shape[1]} centered channels (intensity + shape)")
-        print(f"Note: Mean Sv encodes intensity, centered values encode spectral shape")
-    
+    logger.info(
+        "Extracted %s valid samples using '%s' strategy, shape %s",
+        f"{n_samples:,}", feature_strategy, ml_data_flat.shape
+    )
+
     return ml_data_flat, grid_indices
 
 
@@ -439,15 +433,15 @@ def store_ml_data_flattened(ds_ml_ready, ml_data_flat, grid_indices, dataset_nam
         )
         ds_ml_ready[mapping_name].attrs['long_name'] = f'Sample-index to grid-index mapping for {dataset_name}'
         ds_ml_ready[mapping_name].attrs['description'] = f'Maps {sample_index_coord_name} to original grid_index'
-        print(f"Created {mapping_name} mapping with {len(grid_indices)} samples")
+        logger.info("Created %s mapping with %d samples", mapping_name, len(grid_indices))
     else:
         existing_mapping = ds_ml_ready[mapping_name].values
         if not np.array_equal(existing_mapping, grid_indices):
             raise ValueError(f"Grid indices don't match existing mapping for {dataset_name}")
-        print(f"Using existing {mapping_name} mapping")
+        logger.debug("Using existing %s mapping", mapping_name)
 
-    print(f"Stored {dataset_name} in flattened format")
-    
+    logger.info("Stored %s in flattened format", dataset_name)
+
     return ds_ml_ready
 
 
@@ -485,8 +479,8 @@ def reshape_data_for_ml(ds_Sv, data_var='Sv_corrected', dataset_name='ml_data_cl
     mask_name = f"{dataset_name}_valid_mask"
     if custom_data_mask_name is not None:
         mask_name = f"{dataset_name}_{custom_data_mask_name}"
-    
-    print("Creating validity mask...")
+
+    logger.info("Creating validity mask...")
 
     if data_var not in ds_Sv:
         raise ValueError(f"Data variable '{data_var}' not found in dataset")
@@ -507,27 +501,31 @@ def reshape_data_for_ml(ds_Sv, data_var='Sv_corrected', dataset_name='ml_data_cl
     
     # Notify user and filter if necessary
     if len(channels_all_nan) > 0:
-        print(f"WARNING: Found {len(channels_all_nan)} channel(s) with all NaN values: {channels_all_nan}")
-        print(f"These channels will be excluded from processing.")
-        print(f"Keeping {len(channels_to_keep)} valid channel(s): {channels_to_keep}")
-        
+        logger.warning(
+            "Found %d channel(s) with all NaN values: %s. Excluding from processing.",
+            len(channels_all_nan), channels_all_nan
+        )
+        logger.info("Keeping %d valid channel(s): %s", len(channels_to_keep), channels_to_keep)
+
         # Filter dataset to only include valid channels
         ds_Sv = ds_Sv.sel(channel=channels_to_keep)
-        
+
         # Adjust baseline_channel if necessary
         if baseline_channel >= len(channels_to_keep):
             old_baseline = baseline_channel
             baseline_channel = 0  # Default to first valid channel
-            print(f"WARNING: baseline_channel {old_baseline} is out of range after filtering.")
-            print(f"Setting baseline_channel to {baseline_channel} (channel: {channels_to_keep[baseline_channel]})")
+            logger.warning(
+                "baseline_channel %d is out of range after filtering. Setting to %d (channel: %s).",
+                old_baseline, baseline_channel, channels_to_keep[baseline_channel]
+            )
     
 
     if data.dims[0] != 'channel':
-        print(f"Reordering dimensions from {data.dims} to channel-first...")
+        logger.debug("Reordering dimensions from %s to channel-first.", data.dims)
         spatial_dims = [dim for dim in data.dims if dim != 'channel']
         desired_order = ['channel'] + spatial_dims
         data = data.transpose(*desired_order)
-        print(f"New dimension order: {data.dims}")
+        logger.debug("New dimension order: %s", data.dims)
         ds_working = ds_Sv.copy()
         ds_working[data_var] = data
     else:
@@ -544,22 +542,22 @@ def reshape_data_for_ml(ds_Sv, data_var='Sv_corrected', dataset_name='ml_data_cl
     
     ds_ml_ready = create_ml_index_coordinate(ds_with_mask, data_var=sv_var, dataset_name=dataset_name)
 
-    print(f"Preparing ML data from '{sv_var}' as '{dataset_name}'...")
-    print(f"Data shape: {ds_ml_ready[sv_var].shape}")
-    
+    logger.info("Preparing ML data from '%s' as '%s'.", sv_var, dataset_name)
+    logger.debug("Data shape: %s", ds_ml_ready[sv_var].shape)
+
     ml_data_flat, grid_indices = extract_ml_data_flattened(
         ds_ml_ready, sv_var, mask_name=mask_name, dataset_name=dataset_name,
         feature_strategy=feature_strategy, baseline_channel=baseline_channel, **feature_kwargs
     )
     ds_ml_ready = store_ml_data_flattened(ds_ml_ready, ml_data_flat, grid_indices, dataset_name)
 
-    print(f"Data stored as: '{dataset_name}'")
-    
+    logger.info("Data stored as '%s'.", dataset_name)
+
     return ds_ml_ready
 
 
-def normalize_data(ds_ml_ready, method='standard', pre_L2_method='standard', 
-                  shift_positive=False, per_feature=True, dataset_name='ml_data_clean', 
+def normalize_data(ds_ml_ready, method='standard', pre_l2_method='standard',
+                  shift_positive=False, per_feature=True, dataset_name='ml_data_clean',
                   normalization_name=None, feature_weights=None, n_quantiles=100, flatten_weight=1):
     """Normalize flattened ML data using a variety of scaling methods.
 
@@ -572,7 +570,7 @@ def normalize_data(ds_ml_ready, method='standard', pre_L2_method='standard',
         method (str): Normalization method. One of 'standard', 'robust',
             'minmax', 'flatten', 'power', 'quantile', 'umap',
             'flatten_plus_umap', or 'l2'. Defaults to 'standard'.
-        pre_L2_method (str): Scaler applied before L2 normalization when
+        pre_l2_method (str): Scaler applied before L2 normalization when
             method is 'l2'. Defaults to 'standard'.
         shift_positive (bool): Shift all values to be positive after
             normalization. Defaults to False.
@@ -594,7 +592,7 @@ def normalize_data(ds_ml_ready, method='standard', pre_L2_method='standard',
     # Set default normalization_name based on method
     if normalization_name is None:
         if method == 'l2':
-            normalization_name = f'l2_{pre_L2_method}_normalized' if pre_L2_method != 'none' else 'l2_normalized'
+            normalization_name = f'l2_{pre_l2_method}_normalized' if pre_l2_method != 'none' else 'l2_normalized'
         else:
             normalization_name = f'{method}_normalized'
     
@@ -603,31 +601,31 @@ def normalize_data(ds_ml_ready, method='standard', pre_L2_method='standard',
     if per_feature:
         if method == 'l2':
             # L2 normalization with optional pre-normalization
-            if pre_L2_method == 'standard' or pre_L2_method == 'standard_shifted':
+            if pre_l2_method == 'standard' or pre_l2_method == 'standard_shifted':
                 pre_scaler = StandardScaler()
-            elif pre_L2_method == 'robust':
+            elif pre_l2_method == 'robust':
                 pre_scaler = RobustScaler()
-            elif pre_L2_method == 'minmax':
+            elif pre_l2_method == 'minmax':
                 pre_scaler = MinMaxScaler()
-            elif pre_L2_method == 'none':
+            elif pre_l2_method == 'none':
                 pre_scaler = None
             else:
-                raise ValueError(f"Unknown pre_L2_method: {pre_L2_method}")
+                raise ValueError(f"Unknown pre_l2_method: {pre_l2_method}")
 
             if pre_scaler:
                 pre_normalized = pre_scaler.fit_transform(X_clean)
             else:
                 pre_normalized = X_clean
 
-            if pre_L2_method == 'standard_shifted':
+            if pre_l2_method == 'standard_shifted':
                 pre_normalized = pre_normalized + 2  # Shift 2 SDs
-            
+
             scaler = Normalizer(norm='l2')
             X_normalized = scaler.fit_transform(pre_normalized)
-            
+
             normalization_info = {
                 'method': method,
-                'pre_L2_method': pre_L2_method,
+                'pre_l2_method': pre_l2_method,
                 'per_frequency': per_feature,
                 'shift_positive': shift_positive
             }
@@ -691,7 +689,7 @@ def normalize_data(ds_ml_ready, method='standard', pre_L2_method='standard',
             }
     else:
         # Global normalization across all features
-        print(f"Using GLOBAL normalization (treating all features together)")
+        logger.info("Using global normalization (treating all features together).")
         
         X_flat = X_clean.flatten()
         
@@ -745,21 +743,19 @@ def normalize_data(ds_ml_ready, method='standard', pre_L2_method='standard',
             raise ValueError(f"feature_weights length ({len(feature_weights)}) must match number of features ({X_normalized.shape[1]})")
         X_normalized = X_normalized * feature_weights
         normalization_info['feature_weights'] = feature_weights
-        print(f"Applied feature weights: {feature_weights}")
+        logger.info("Applied feature weights: %s", feature_weights)
 
-    # Print summary
-    print(f"Normalization method: {method}")
     if not per_feature and method != 'l2':
-        print(f"Normalization scope: GLOBAL (across all features)")
+        scope = 'global (across all features)'
     elif method != 'l2':
-        print(f"Normalization scope: PER-FEATURE (each feature independently)")
+        scope = 'per-feature (each feature independently)'
     else:
-        print(f"Normalization scope: PER-SAMPLE (L2 unit vectors)")
-    
-    print(f"Original data range: {X_clean.min():.2f} to {X_clean.max():.2f}")
-    print(f"Normalized data range: {X_normalized.min():.2f} to {X_normalized.max():.2f}")
-    print(f"Normalized mean per feature: {X_normalized.mean(axis=0)}")
-    print(f"Normalized std per feature: {X_normalized.std(axis=0)}")
+        scope = 'per-sample (L2 unit vectors)'
+    logger.info("Normalization method: %s, scope: %s", method, scope)
+    logger.info("Original data range: %.2f to %.2f", X_clean.min(), X_clean.max())
+    logger.info("Normalized data range: %.2f to %.2f", X_normalized.min(), X_normalized.max())
+    logger.debug("Normalized mean per feature: %s", X_normalized.mean(axis=0))
+    logger.debug("Normalized std per feature: %s", X_normalized.std(axis=0))
 
     # Store in dataset using the source data's coordinate system
     source_sample_index_coord_name = f'{dataset_name}_sample_index'
@@ -779,77 +775,9 @@ def normalize_data(ds_ml_ready, method='standard', pre_L2_method='standard',
     )
 
     ds_ml_ready[normalized_data_name] = ml_data_normalized
-    print(f"Stored normalized data as '{normalized_data_name}'")
-    
-    feature_names = ds_ml_ready[dataset_name].coords[feature_dim_name].values
-    visualize_normalized_data_histogram(X_normalized, feature_names=feature_names)
+    logger.info("Stored normalized data as '%s'.", normalized_data_name)
 
     return ds_ml_ready
-
-def visualize_normalized_data_histogram(X_normalized, feature_names=None, n_bins=200, as_density=True, percentile_range=(.1, 99.9)):
-    """Plot overlaid histograms of each feature after normalization.
-
-    Args:
-        X_normalized (np.ndarray): 2-D array of shape
-            ``(n_samples, n_features)``.
-        feature_names (list[str] or None): Labels for each feature.
-            Auto-generated when None. Defaults to None.
-        n_bins (int): Number of histogram bins. Defaults to 200.
-        as_density (bool): Plot as probability density. Defaults to True.
-        percentile_range (tuple[float] or None): ``(lower, upper)``
-            percentiles for the x-axis range. Use ``None`` for the full
-            data range. Defaults to (0.1, 99.9).
-    """
-    if X_normalized.ndim != 2:
-        raise ValueError("X_normalized must be 2D (n_samples, n_features)")
-    n_features = X_normalized.shape[1]
-
-    if feature_names is None:
-        feature_names = [f'Feature {i}' for i in range(n_features)]
-    else:
-        # make sure labels are strings and length matches
-        feature_names = [str(n) for n in feature_names]
-        if len(feature_names) != n_features:
-            raise ValueError("feature_names length must match number of features")
-
-    plt.figure(figsize=(10, 8))  # taller so legend fits inside
-    colors = plt.cm.tab10.colors
-
-    # Determine bin range: use percentiles if specified, otherwise full range
-    if percentile_range is not None:
-        lower_percentile, upper_percentile = percentile_range
-        global_min = np.nanpercentile(X_normalized, lower_percentile)
-        global_max = np.nanpercentile(X_normalized, upper_percentile)
-        print(f"Using {lower_percentile}th to {upper_percentile}th percentile range: {global_min:.3f} to {global_max:.3f}")
-    else:
-        global_min = float(np.nanmin(X_normalized))
-        global_max = float(np.nanmax(X_normalized))
-        print(f"Using full data range: {global_min:.3f} to {global_max:.3f}")
-
-    bins = np.linspace(global_min, global_max, n_bins + 1)
-
-    for i in range(n_features):
-        data = X_normalized[:, i]
-        plt.hist(
-            data,
-            bins=bins,
-            density=as_density,
-            histtype='step',
-            color=colors[i % len(colors)],
-            linewidth=2,
-            label=feature_names[i]
-        )
-
-    plt.title('Histogram of Normalized Data')
-    plt.xlabel('Normalized Value')
-    plt.ylabel('Density' if as_density else 'Frequency')
-    # place legend inside plot, compact
-    plt.legend(loc='upper right', fontsize=9, frameon=True)
-    plt.grid(alpha=0.25)
-    y_min, y_max = plt.ylim()
-    plt.ylim(y_min, y_max * 1.1)
-    plt.tight_layout()
-    plt.show()
 
 
 def extract_valid_samples_for_sklearn(ds_ml_ready, specific_data_name=None, dataset_name='ml_data_clean'):
@@ -888,7 +816,7 @@ def extract_valid_samples_for_sklearn(ds_ml_ready, specific_data_name=None, data
         mapping_name = f'{dataset_name}_sample_index_to_grid_index'
         result_sample_indices = data.coords[sample_index_coord_name].values
         grid_indices = ds_ml_ready[mapping_name][result_sample_indices].values
-        print(f"Using flattened data '{full_data_var}': {X.shape[0]:,} samples with {X.shape[1]} features")
+        logger.debug("Using flattened data '%s': %d samples with %d features.", full_data_var, X.shape[0], X.shape[1])
         return X, grid_indices, result_sample_indices
     else:
         raise ValueError(f"Data variable '{full_data_var}' not in expected flattened format with {sample_index_coord_name} dimension")
@@ -928,7 +856,7 @@ def store_ml_results_flattened(ds_ml_ready, flat_results, specific_data_name, da
             )
         
         result_sample_indices = source_sample_indices
-        print(f"Using all {len(source_sample_indices)} samples from '{dataset_name}'")
+        logger.info("Using all %d samples from '%s'.", len(source_sample_indices), dataset_name)
     else:
         if not np.all(np.isin(result_sample_indices, source_sample_indices)):
             invalid_indices = result_sample_indices[~np.isin(result_sample_indices, source_sample_indices)]
@@ -937,8 +865,11 @@ def store_ml_results_flattened(ds_ml_ready, flat_results, specific_data_name, da
         if len(flat_results) != len(result_sample_indices):
             raise ValueError(f"Length mismatch: flat_results has {len(flat_results)} elements "
                             f"but result_sample_indices has {len(result_sample_indices)} elements")
-        
-        print(f"Using custom subset: {len(result_sample_indices)} of {len(source_sample_indices)} samples from '{dataset_name}'")
+
+        logger.info(
+            "Using custom subset: %d of %d samples from '%s'.",
+            len(result_sample_indices), len(source_sample_indices), dataset_name
+        )
 
 
     full_result_name = f"{dataset_name}_{specific_data_name}"
@@ -959,12 +890,12 @@ def store_ml_results_flattened(ds_ml_ready, flat_results, specific_data_name, da
     ds_ml_ready[full_result_name].attrs['long_name'] = f'ML {specific_data_name} (flattened)'
     ds_ml_ready[full_result_name].attrs['description'] = f'ML results using subset of {sample_index_coord_name} indices'
     
-    # Print summary
+    # Log summary
     unique_values, counts = np.unique(flat_results, return_counts=True)
-    print(f"Stored {specific_data_name} using {len(result_sample_indices)} {sample_index_coord_name} indices")
+    logger.info("Stored '%s' using %d %s indices.", specific_data_name, len(result_sample_indices), sample_index_coord_name)
     for value, count in zip(unique_values, counts):
         percentage = count / len(flat_results) * 100
-        print(f"  {specific_data_name} {value}: {count:,} ({percentage:.1f}%)")
+        logger.debug("  %s %s: %d (%.1f%%)", specific_data_name, value, count, percentage)
     
     return ds_ml_ready
 
@@ -1040,9 +971,8 @@ def extract_ml_data_gridded(ds_ml_ready, specific_data_name="", dataset_name='ml
             }
         )
         
-        print(f"Regridded {len(flat_results):,} ML samples with {n_features} features to grid")
-        
-        print(f"Grid shape: {grid_shape}, fill value: {fill_value}")
+        logger.info("Regridded %d ML samples with %d features to grid.", len(flat_results), n_features)
+        logger.debug("Grid shape: %s, fill value: %s", grid_shape, fill_value)
         
     else:
         # Single-dimensional case (e.g., cluster labels) - existing logic
@@ -1060,8 +990,8 @@ def extract_ml_data_gridded(ds_ml_ready, specific_data_name="", dataset_name='ml
         )
 
         unique_values, counts = np.unique(flat_results.values, return_counts=True)
-        print(f"Regridded {len(flat_results):,} results to grid")
-        print(f"Grid shape: {grid_shape}, fill value: {fill_value}")
+        logger.info("Regridded %d results to grid.", len(flat_results))
+        logger.debug("Grid shape: %s, fill value: %s", grid_shape, fill_value)
     
     result_grid_da.attrs['long_name'] = f'ML {specific_data_name} (gridded)' if specific_data_name else f'ML {dataset_name} (gridded)'
     result_grid_da.attrs['description'] = f'ML results regridded using lookup arrays'
@@ -1072,458 +1002,9 @@ def extract_ml_data_gridded(ds_ml_ready, specific_data_name="", dataset_name='ml
     if store_in_dataset:
         grid_name = f'{full_result_name}_grid'
         ds_ml_ready[grid_name] = result_grid_da
-        print(f"Stored gridded results as '{grid_name}'")
-        
+        logger.info("Stored gridded results as '%s'.", grid_name)
+
     return result_grid_da
-
-
-def apply_dbscan_clustering(
-        X_normalized, 
-        sample_indices, 
-        eps_values=[0.3, 0.5, 0.7, 1.0], 
-        min_samples_values=[5, 10, 20], 
-        sample_size=None, 
-        calculate_silhouette=True, 
-        silhouette_sample_size=10000, 
-        metric="euclidean", 
-        algorithm="auto", 
-        useHDBScan=False, 
-        min_cluster_size=5, 
-        cluster_selection_method='eom',
-        soft_membership_threshold=None
-        ):
-    """Run DBSCAN or HDBSCAN clustering over a parameter grid.
-
-    Iterates over the provided parameter values, fits a model for each
-    combination, and returns results including labels and scores.
-
-    Args:
-        X_normalized (np.ndarray): Feature matrix of shape
-            ``(n_samples, n_features)``.
-        sample_indices (np.ndarray): Grid-index values corresponding to
-            each row of *X_normalized*.
-        eps_values (list[float]): Epsilon values for DBSCAN neighbourhood
-            radius (ignored when *useHDBScan* is True).
-            Defaults to [0.3, 0.5, 0.7, 1.0].
-        min_samples_values (list[int]): Core-point neighbourhood sizes
-            to try. Defaults to [5, 10, 20].
-        sample_size (int or None): Sub-sample size for large datasets.
-            Defaults to None (all data).
-        calculate_silhouette (bool): Compute silhouette scores.
-            Defaults to True.
-        silhouette_sample_size (int): Sample size for faster silhouette
-            calculation. Defaults to 10000.
-        metric (str): Distance metric. Defaults to 'euclidean'.
-        algorithm (str): DBSCAN algorithm variant. Defaults to 'auto'.
-        useHDBScan (bool): Use HDBSCAN instead of DBSCAN.
-            Defaults to False.
-        min_cluster_size (int): Minimum cluster size (HDBSCAN parameter /
-            DBSCAN post-filter). Defaults to 5.
-        cluster_selection_method (str): HDBSCAN cluster selection method.
-            Defaults to 'eom'.
-        soft_membership_threshold (float or None): If set, reassign
-            HDBSCAN noise points whose soft-membership probability
-            exceeds this threshold. Defaults to None.
-
-    Returns:
-        dict: Keyed by parameter string, each value is a dict with keys
-        ``'model'``, ``'labels'``, ``'silhouette_score'``,
-        ``'sample_indices'``, ``'n_clusters'``, ``'n_noise'``, etc.
-    """
-    
-    # Use all data or sample based on parameter
-    if sample_size is not None and sample_size < len(X_normalized):
-        print(f"Using random sample of {sample_size:,} points for {'HDBSCAN' if useHDBScan else 'DBSCAN'} clustering (from {len(X_normalized):,} total)")
-        np.random.seed(42)  # For reproducibility
-        subsample_mask = np.random.choice(len(X_normalized), size=sample_size, replace=False)
-        X_sample = X_normalized[subsample_mask]
-        used_sample_indices = sample_indices[subsample_mask]  # Get corresponding indices
-    else:
-        print(f"Using ALL {len(X_normalized):,} valid data points for {'HDBSCAN' if useHDBScan else 'DBSCAN'} clustering")
-        X_sample = X_normalized
-        used_sample_indices = sample_indices
-    
-    results = {}
-    
-    if useHDBScan:
-        print("HDBSCAN clustering results:")
-        if calculate_silhouette and len(X_sample) > silhouette_sample_size:
-            print(f"Note: Silhouette scores calculated on sample of {silhouette_sample_size:,} points for efficiency")
-        
-        for min_samples in min_samples_values:
-            param_key = f"hdbscan_mincluster_{min_cluster_size}_min_{min_samples}"
-            print(f"\nTesting HDBSCAN with min_cluster_size={min_cluster_size}, min_samples={min_samples}...")
-            
-            # Apply HDBSCAN
-            start_time = time.time()
-            
-            if metric == "mahalanobis":
-                V = np.cov(X_normalized, rowvar=False)
-                model = hdbscan.HDBSCAN(min_cluster_size=min_cluster_size, min_samples=min_samples, metric=metric, V=V, cluster_selection_method=cluster_selection_method, prediction_data=True)
-            else:
-                model = hdbscan.HDBSCAN(min_cluster_size=min_cluster_size, min_samples=min_samples, metric=metric, cluster_selection_method=cluster_selection_method, prediction_data=True)
-            
-            cluster_labels = model.fit_predict(X_sample)
-            clustering_time = time.time() - start_time
-            print(f"  HDBSCAN fitting took: {clustering_time:.2f} seconds")
-            
-            # Get number of clusters (excluding noise points labeled as -1)
-            n_clusters = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
-            n_noise = list(cluster_labels).count(-1)
-            
-            # Calculate silhouette score with sampling for efficiency
-            sil_score = _calculate_silhouette(X_sample, cluster_labels, n_clusters, calculate_silhouette, silhouette_sample_size)
-
-            print("Before noise reassignment:")
-            print_basic_cluster_stats(cluster_labels, n_clusters, n_noise, sil_score, calculate_silhouette)
-
-            if soft_membership_threshold is not None:
-                cluster_labels = assign_noise_by_soft_membership(model, threshold=soft_membership_threshold)
-
-            print("After noise reassignment:")
-
-            n_clusters = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
-            n_noise = list(cluster_labels).count(-1)
-            # Calculate silhouette score with sampling for efficiency
-            sil_score = _calculate_silhouette(X_sample, cluster_labels, n_clusters, calculate_silhouette, silhouette_sample_size)
-            print_basic_cluster_stats(cluster_labels, n_clusters, n_noise, sil_score, calculate_silhouette)
-
-            # Store results
-            results[param_key] = {
-                'model': model,
-                'labels': cluster_labels,
-                'silhouette_score': sil_score,
-                'sample_indices': used_sample_indices,
-                'n_clusters': n_clusters,
-                'n_noise': n_noise,
-                'eps': None,  # HDBSCAN doesn't use eps
-                'min_samples': min_samples,
-                'min_cluster_size': min_cluster_size,
-                'metric': metric,
-            }
-            
-            # Show cluster statistics
-            print_basic_cluster_stats(cluster_labels, n_clusters, n_noise, sil_score, calculate_silhouette)
-    
-    else:
-        # Standard DBSCAN: Loop through eps and min_samples
-        print("DBSCAN clustering results:")
-        if calculate_silhouette and len(X_sample) > silhouette_sample_size:
-            print(f"Note: Silhouette scores calculated on sample of {silhouette_sample_size:,} points for efficiency")
-        
-        for eps in eps_values:
-            for min_samples in min_samples_values:
-                param_key = f"eps_{eps}_min_{min_samples}"
-                print(f"\nTesting DBSCAN with eps={eps}, min_samples={min_samples}...")
-                
-                # Apply DBSCAN
-                start_time = time.time()
-                model = DBSCAN(eps=eps, min_samples=min_samples, metric=metric, algorithm=algorithm)
-                cluster_labels = model.fit_predict(X_sample)
-                
-                # Apply min_cluster_size filter as post-processing
-                filtered_labels = apply_min_cluster_size_filter(cluster_labels, min_cluster_size)
-                cluster_labels = filtered_labels
-                
-                clustering_time = time.time() - start_time
-                print(f"  DBSCAN fitting took: {clustering_time:.2f} seconds")
-                
-                # Get number of clusters (excluding noise points labeled as -1)
-                n_clusters = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
-                n_noise = list(cluster_labels).count(-1)
-                
-                # Calculate silhouette score with sampling for efficiency
-                sil_score = _calculate_silhouette(X_sample, cluster_labels, n_clusters, calculate_silhouette, silhouette_sample_size)
-
-                # Show cluster statistics
-                print_basic_cluster_stats(cluster_labels, n_clusters, n_noise, sil_score, calculate_silhouette)
-
-                # Store results
-                results[param_key] = {
-                    'model': model,
-                    'labels': cluster_labels,
-                    'silhouette_score': sil_score,
-                    'sample_indices': used_sample_indices,
-                    'n_clusters': n_clusters,
-                    'n_noise': n_noise,
-                    'eps': eps,
-                    'min_samples': min_samples,
-                    'metric': metric,
-                }
-
-    return results
-
-
-def assign_noise_by_soft_membership(clusterer, threshold=0.1):
-    """Assign noise points to clusters based on soft membership probabilities.
-
-    Args:
-        clusterer (hdbscan.HDBSCAN): Fitted HDBSCAN clusterer with
-            ``prediction_data=True``.
-        threshold (float): Minimum probability required to assign a noise
-            point to a cluster. Defaults to 0.1.
-
-    Returns:
-        np.ndarray: Cluster labels with noise points reassigned if their
-        max probability exceeds *threshold*.
-    """
-    print("start reassignment")
-    # Get hard cluster labels
-    labels = clusterer.labels_.copy()
-    # Get soft membership vectors for all points
-    soft_clusters = hdbscan.all_points_membership_vectors(clusterer)
-    
-    print("starting iteration")
-    # Vectorized approach: find noise points and their best clusters
-    noise_mask = labels == -1
-    if np.any(noise_mask):
-        # Get max probabilities and best clusters for noise points only
-        noise_soft_clusters = soft_clusters[noise_mask]
-        # Combined argmax and max in single operation (more cache efficient)
-        best_clusters = np.argmax(noise_soft_clusters, axis=1)
-        max_probs = noise_soft_clusters[np.arange(len(best_clusters)), best_clusters]
-        
-        # Find which noise points exceed threshold
-        reassign_mask = max_probs > threshold
-        
-        # Create indices for noise points that should be reassigned
-        noise_indices = np.where(noise_mask)[0]
-        reassign_indices = noise_indices[reassign_mask]
-        
-        # Assign new cluster labels
-        labels[reassign_indices] = best_clusters[reassign_mask]
-        
-        print(f"Reassigned {np.sum(reassign_mask)} of {np.sum(noise_mask)} noise points")
-    
-    print("end reassignment")
-    return labels
-
-
-def _calculate_silhouette(X_sample, cluster_labels, n_clusters, calculate_silhouette, silhouette_sample_size):
-    """Compute silhouette score, optionally on a random subsample.
-
-    Args:
-        X_sample (np.ndarray): Feature matrix.
-        cluster_labels (np.ndarray): Cluster label per sample.
-        n_clusters (int): Number of clusters found.
-        calculate_silhouette (bool): Whether to compute the score.
-        silhouette_sample_size (int): Maximum samples for calculation.
-
-    Returns:
-        float: Silhouette score, or -1 if not computed.
-    """
-    if calculate_silhouette and n_clusters > 1 and n_clusters < len(X_sample):
-        sil_start_time = time.time()
-        try:
-            if len(X_sample) > silhouette_sample_size:
-                # Sample for silhouette calculation to avoid O(n²) slowdown
-                np.random.seed(42)
-                sil_indices = np.random.choice(len(X_sample), size=silhouette_sample_size, replace=False)
-                X_sil_sample = X_sample[sil_indices]
-                labels_sil_sample = cluster_labels[sil_indices]
-                
-                # Only calculate if sampled data still has multiple clusters
-                if len(set(labels_sil_sample)) > 1:
-                    sil_score = silhouette_score(X_sil_sample, labels_sil_sample)
-                else:
-                    sil_score = -1
-            else:
-                sil_score = silhouette_score(X_sample, cluster_labels)
-                
-            sil_time = time.time() - sil_start_time
-            print(f"  Silhouette calculation took: {sil_time:.2f} seconds")
-        except Exception:
-            sil_score = -1
-    else:
-        sil_score = -1
-
-    return sil_score
-
-
-def print_basic_cluster_stats(cluster_labels, n_clusters, n_noise, sil_score, calculate_silhouette):
-    """Print a summary table of cluster sizes and silhouette score.
-
-    Args:
-        cluster_labels (np.ndarray): Cluster label per sample.
-        n_clusters (int): Number of clusters.
-        n_noise (int): Number of noise points.
-        sil_score (float): Silhouette score.
-        calculate_silhouette (bool): Whether silhouette was requested.
-    """
-    unique_labels, counts = np.unique(cluster_labels, return_counts=True)
-    print(f"  Number of clusters: {n_clusters}")
-    print(f"  Noise points: {n_noise} ({n_noise/len(cluster_labels)*100:.1f}%)")
-    
-    # More detailed silhouette score reporting
-    if not calculate_silhouette:
-        print(f"  Silhouette Score: Disabled (calculate_silhouette=False)")
-    elif n_clusters <= 1:
-        print(f"  Silhouette Score: N/A (need ≥2 clusters, found {n_clusters})")
-    elif n_clusters >= len(cluster_labels):
-        print(f"  Silhouette Score: N/A (too many clusters relative to data)")
-    elif sil_score > -1:
-        print(f"  Silhouette Score: {sil_score:.3f}")
-    else:
-        print(f"  Silhouette Score: Calculation failed (possibly due to sampling issues)")
-    
-    if n_clusters > 0:
-        cluster_sizes = {}
-        for label, count in zip(unique_labels, counts):
-            if label == -1:
-                cluster_sizes['Noise'] = count
-            else:
-                cluster_sizes[f'Cluster {label}'] = count
-        print(f"  Cluster sizes: {cluster_sizes}")
-
-
-def apply_kmeans_clustering(X_normalized, sample_indices, k_values=[3, 5, 7], sample_size=None, 
-                           calculate_silhouette=True, silhouette_sample_size=10000):
-    """Run K-means clustering for each value of *k*.
-
-    Args:
-        X_normalized (np.ndarray): Feature matrix of shape
-            ``(n_samples, n_features)``.
-        sample_indices (np.ndarray): Grid-index values for each row.
-        k_values (list[int]): Numbers of clusters to try.
-            Defaults to [3, 5, 7].
-        sample_size (int or None): Sub-sample size for large datasets.
-            Defaults to None.
-        calculate_silhouette (bool): Compute silhouette scores.
-            Defaults to True.
-        silhouette_sample_size (int): Sample size for faster silhouette
-            calculation. Defaults to 10000.
-
-    Returns:
-        dict: Keyed by *k*, each value is a dict with ``'model'``,
-        ``'labels'``, ``'silhouette_score'``, ``'inertia'``, and
-        ``'sample_indices'``.
-    """
-    
-    if sample_size is not None and sample_size < len(X_normalized):
-        print(f"Using random sample of {sample_size:,} points for clustering (from {len(X_normalized):,} total)")
-        np.random.seed(42)  # For reproducibility
-        subsample_mask = np.random.choice(len(X_normalized), size=sample_size, replace=False)
-        X_sample = X_normalized[subsample_mask]
-        used_sample_indices = sample_indices[subsample_mask]  # Get corresponding indices
-    else:
-        print(f"Using ALL {len(X_normalized):,} valid data points for clustering")
-        X_sample = X_normalized
-        used_sample_indices = sample_indices
-        
-    
-    results = {}
-    
-    print("K-means clustering results:")
-    if calculate_silhouette and len(X_sample) > silhouette_sample_size:
-        print(f"Note: Silhouette scores calculated on sample of {silhouette_sample_size:,} points for efficiency")
-    
-    for k in k_values:
-        print(f"\nTesting K-means with k={k} clusters...")
-        
-        kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-        cluster_labels = kmeans.fit_predict(X_sample)
-        
-        # Calculate silhouette score with sampling for efficiency
-        if calculate_silhouette:
-            if len(X_sample) > silhouette_sample_size:
-                np.random.seed(42)
-                sil_indices = np.random.choice(len(X_sample), size=silhouette_sample_size, replace=False)
-                X_sil_sample = X_sample[sil_indices]
-                labels_sil_sample = cluster_labels[sil_indices]
-                sil_score = silhouette_score(X_sil_sample, labels_sil_sample)
-            else:
-                sil_score = silhouette_score(X_sample, cluster_labels)
-        else:
-            sil_score = -999  # Placeholder when not calculated
-        
-        # Calculate inertia (within-cluster sum of squares)
-        inertia = kmeans.inertia_
-        
-        # Store results
-        results[k] = {
-            'model': kmeans,
-            'labels': cluster_labels,
-            'silhouette_score': sil_score,
-            'inertia': inertia,
-            'sample_indices': used_sample_indices
-        }
-        
-        # Show cluster statistics
-        unique_labels, counts = np.unique(cluster_labels, return_counts=True)
-        if calculate_silhouette and sil_score != -999:
-            print(f"  Silhouette Score: {sil_score:.3f}")
-        else:
-            print(f"  Silhouette Score: Not calculated (use calculate_silhouette=True)")
-        print(f"  Inertia (WCSS): {inertia:.2f}")
-        print(f"  Cluster sizes: {dict(zip(unique_labels, counts))}")
-    
-    return results
-
-
-def apply_min_cluster_size_filter(cluster_labels, min_cluster_size):
-    """Apply min_cluster_size filtering to DBSCAN results as post-processing.
-
-    Clusters smaller than *min_cluster_size* are reclassified as noise (-1).
-    Remaining clusters are renumbered to be consecutive starting from 0.
-
-    Args:
-        cluster_labels (np.ndarray): Original cluster labels from DBSCAN.
-        min_cluster_size (int): Minimum number of points required for a
-            cluster to be kept.
-
-    Returns:
-        np.ndarray: Filtered cluster labels with small clusters converted
-        to noise and remaining clusters renumbered consecutively.
-    """
-    if min_cluster_size <= 1:
-        return cluster_labels.copy()
-    
-    # Get unique labels and their counts
-    unique_labels, counts = np.unique(cluster_labels, return_counts=True)
-    
-    # Create mapping for labels to keep vs convert to noise
-    filtered_labels = cluster_labels.copy()
-    
-    clusters_removed = 0
-    points_converted_to_noise = 0
-    
-    # Step 1: Convert small clusters to noise
-    for label, count in zip(unique_labels, counts):
-        # Skip noise points (already labeled as -1)
-        if label == -1:
-            continue
-            
-        # Convert small clusters to noise
-        if count < min_cluster_size:
-            filtered_labels[cluster_labels == label] = -1
-            clusters_removed += 1
-            points_converted_to_noise += count
-    
-    # Step 2: Renumber remaining clusters to be consecutive
-    remaining_labels = np.unique(filtered_labels)
-    remaining_clusters = remaining_labels[remaining_labels != -1]  # Exclude noise
-    
-    if len(remaining_clusters) > 0:
-        # Create mapping from old labels to new consecutive labels
-        label_mapping = {}
-        for new_label, old_label in enumerate(remaining_clusters):
-            label_mapping[old_label] = new_label
-        
-        # Apply the mapping
-        renumbered_labels = filtered_labels.copy()
-        for old_label, new_label in label_mapping.items():
-            renumbered_labels[filtered_labels == old_label] = new_label
-        
-        filtered_labels = renumbered_labels
-        
-        print(f"  Min cluster size filter: removed {clusters_removed} small clusters "
-              f"({points_converted_to_noise} points → noise), {len(remaining_clusters)} clusters remaining")
-        print(f"  Renumbered clusters: {sorted(remaining_clusters)} → {list(range(len(remaining_clusters)))}")
-    else:
-        print(f"  Min cluster size filter: removed {clusters_removed} small clusters "
-              f"({points_converted_to_noise} points → noise), 0 clusters remaining")
-    
-    return filtered_labels
 
 
 def extract_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_data_clean', 
@@ -1726,380 +1207,6 @@ def extract_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_
     }
     
     return stats_dict
-
-
-def print_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_data_clean', 
-                            normalize_data_name=None, sv_data_var=None, compute_pairwise_diffs=False):
-    """Print statistics (mean and standard deviation) for each cluster.
-
-    Args:
-        ds_ml_ready (xr.Dataset): Dataset containing cluster labels and
-            source data.
-        cluster_data_name (str): Name of the cluster labels variable
-            (e.g. ``'kmeans_clusters_k_5'``, ``'dbscan_clusters_5'``).
-        dataset_name (str): Base dataset name.
-            Defaults to 'ml_data_clean'.
-        normalize_data_name (str or None): Name of normalized data to use
-            for statistics. Defaults to None (uses *dataset_name*).
-        sv_data_var (str or None): Name of original Sv variable to use
-            for statistics (e.g. ``'Sv'``, ``'Sv_corrected'``). If
-            provided, statistics are calculated from gridded Sv data
-            instead of flattened normalized data. Defaults to None.
-        compute_pairwise_diffs (bool): If True and *sv_data_var* is
-            provided, compute pairwise differences between channels.
-            Defaults to False.
-
-    Returns:
-        list: List of dicts with per-cluster statistics (for backwards
-        compatibility).
-    """
-    
-    # Extract statistics using the shared function
-    stats_dict = extract_cluster_statistics(
-        ds_ml_ready, cluster_data_name, dataset_name, 
-        normalize_data_name, sv_data_var, compute_pairwise_diffs
-    )
-    
-    # Unpack for easier access
-    cluster_stats_list = stats_dict['cluster_stats']
-    noise_stats = stats_dict['noise_stats']
-    metadata = stats_dict['metadata']
-    feature_coords = stats_dict['feature_coords']
-    data_description = stats_dict['data_description']
-    
-    # Print header
-    print(f"\n{'='*80}")
-    print(f"CLUSTER STATISTICS: {cluster_data_name}")
-    print(f"{'='*80}")
-    print(data_description)
-    print(f"Total samples: {metadata['n_total_samples']:,}")
-    print(f"Number of clusters: {metadata['n_clusters']}")
-    if metadata['n_noise'] > 0:
-        print(f"Noise points: {metadata['n_noise']:,} ({metadata['n_noise']/metadata['n_total_samples']*100:.2f}%)")
-    print(f"{'='*80}\n")
-    
-    # Print statistics for each cluster
-    for cluster_stats in cluster_stats_list:
-        cluster_id = cluster_stats['Cluster']
-        n_samples = cluster_stats['N_Samples']
-        percentage = cluster_stats['Percentage']
-        
-        print(f"Cluster {cluster_id:d}:")
-        print(f"  Samples: {n_samples:,} ({percentage:.2f}%)")
-        print(f"  Feature statistics:")
-        
-        for feature_name in feature_coords:
-            mean_val = cluster_stats[f'{feature_name}_mean']
-            std_val = cluster_stats[f'{feature_name}_std']
-            min_val = cluster_stats[f'{feature_name}_min']
-            max_val = cluster_stats[f'{feature_name}_max']
-            
-            print(f"    {feature_name}:")
-            print(f"      Mean: {mean_val:8.3f}  Std: {std_val:7.3f}")
-            print(f"      Min:  {min_val:8.3f}  Max: {max_val:7.3f}")
-        
-        print()
-    
-    # Print noise statistics if present
-    if noise_stats is not None:
-        print(f"Noise (cluster -1):")
-        print(f"  Samples: {noise_stats['N_Samples']:,} ({noise_stats['Percentage']:.2f}%)")
-        print(f"  Feature statistics:")
-        
-        for feature_name in feature_coords:
-            mean_val = noise_stats[f'{feature_name}_mean']
-            std_val = noise_stats[f'{feature_name}_std']
-            print(f"    {feature_name}:")
-            print(f"      Mean: {mean_val:8.3f}  Std: {std_val:7.3f}")
-        print()
-    
-    # Return cluster_stats_list for backwards compatibility
-    return cluster_stats_list
-
-
-
-def plot_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_data_clean',
-                           normalize_data_name=None, sv_data_var=None,
-                           stat_type='mean', include_noise=False, 
-                           cluster_colors=None, figsize=(12, 6),
-                           title=None, save_path=None, compute_pairwise_diffs=False):
-    """Plot cluster statistics as bar charts with error bars.
-
-    Features are grouped by type (Sv vs differences) with shared y-axes.
-    All Sv features share one y-axis, all difference features share another.
-
-    Args:
-        ds_ml_ready (xr.Dataset): Dataset containing cluster labels and
-            source data.
-        cluster_data_name (str): Name of the cluster labels variable.
-        dataset_name (str): Base dataset name.
-            Defaults to 'ml_data_clean'.
-        normalize_data_name (str or None): Name of normalized data.
-            Defaults to None.
-        sv_data_var (str or None): Name of original Sv variable.
-            Defaults to None.
-        stat_type (str): Statistic to plot: ``'mean'``, ``'min'``, or
-            ``'max'``. Defaults to 'mean'.
-        include_noise (bool): Include noise cluster in the plot.
-            Defaults to False.
-        cluster_colors (list[str] or None): Hex colour strings.
-            Defaults to None (uses built-in palette).
-        figsize (tuple): Figure size. Defaults to (12, 6).
-        title (str or None): Custom title. Defaults to None.
-        save_path (str or None): Path to save figure. Defaults to None.
-        compute_pairwise_diffs (bool): If True and *sv_data_var* is
-            provided, compute pairwise differences between channels
-            and plot them on a separate y-axis. Defaults to False.
-
-    Returns:
-        tuple: ``(fig, axes_list, stats_dict)``.
-    """
-    if cluster_colors is None:
-        cluster_colors = [
-                "#00F3FC", "#35E200", "#0400FF", "#F943FF", "#F30101", 
-                "#EDFF4D", "#4E9200", "#970021", "#5600C7", "#017685FF", "#FFA600FF"
-            ]
-
-    # Validate stat_type
-    valid_stat_types = ['mean', 'min', 'max']
-    if stat_type not in valid_stat_types:
-        raise ValueError(f"stat_type must be one of {valid_stat_types}, got '{stat_type}'")
-
-    # Extract statistics using the shared function
-    stats_dict = extract_cluster_statistics(
-        ds_ml_ready, cluster_data_name, dataset_name,
-        normalize_data_name, sv_data_var, compute_pairwise_diffs
-    )
-
-    # Unpack for easier access
-    cluster_stats_list = stats_dict['cluster_stats']
-    noise_stats = stats_dict['noise_stats']
-    feature_coords = stats_dict['feature_coords']
-    data_description = stats_dict['data_description']
-
-    # Determine which clusters to plot
-    clusters_to_plot = cluster_stats_list.copy()
-    if include_noise and noise_stats is not None:
-        clusters_to_plot.append(noise_stats)
-
-    n_clusters = len(clusters_to_plot)
-    n_features = len(feature_coords)
-    cluster_ids = [stats['Cluster'] for stats in clusters_to_plot]
-
-    means = np.zeros((n_clusters, n_features))
-    stds = np.zeros((n_clusters, n_features))
-    stat_values = np.zeros((n_clusters, n_features))
-
-    for i, cluster_stats in enumerate(clusters_to_plot):
-        for j, feature_name in enumerate(feature_coords):
-            means[i, j] = cluster_stats[f'{feature_name}_mean']
-            stds[i, j] = cluster_stats[f'{feature_name}_std']
-            if stat_type == 'mean':
-                stat_values[i, j] = means[i, j]
-            elif stat_type == 'min':
-                stat_values[i, j] = cluster_stats[f'{feature_name}_min']
-            elif stat_type == 'max':
-                stat_values[i, j] = cluster_stats[f'{feature_name}_max']
-
-    # Set up colors for clusters (use provided or default)
-    if cluster_colors is None:
-        prop_cycle = plt.rcParams['axes.prop_cycle']
-        default_colors = prop_cycle.by_key()['color']
-        cluster_color_list = [default_colors[i % len(default_colors)] for i in range(n_clusters)]
-    else:
-        cluster_color_list = []
-        for cluster_id in cluster_ids:
-            if cluster_id == -1:
-                cluster_color_list.append('gray')
-            elif cluster_id < len(cluster_colors):
-                cluster_color_list.append(cluster_colors[cluster_id])
-            else:
-                cluster_color_list.append('gray')
-                print(f"Warning: No color provided for cluster {cluster_id}, using gray")
-
-    # --- Classify features as Sv or difference ---
-    sv_feature_indices = []
-    diff_feature_indices = []
-    
-    for j, feature_name in enumerate(feature_coords):
-        feature_name_lower = str(feature_name).lower()
-        is_sv_feature = (
-            'sv' in feature_name_lower and 'diff' not in feature_name_lower
-        ) or (np.mean(stat_values[:, j]) < -40 and np.mean(stat_values[:, j]) > -100)
-        is_sv_diff = (
-            'diff' in feature_name_lower or
-            (np.min(stat_values[:, j]) > -50 and np.max(stat_values[:, j]) < 50)
-        )
-        
-        if is_sv_feature:
-            sv_feature_indices.append(j)
-        elif is_sv_diff:
-            diff_feature_indices.append(j)
-
-    # Determine baselines and ylims for each feature group
-    baseline_axes_y = 0.5
-    
-    # Calculate for Sv features (baseline = -100)
-    if sv_feature_indices:
-        sv_baseline = -100
-        sv_values = stat_values[:, sv_feature_indices]
-        sv_stds = stds[:, sv_feature_indices]
-        sv_y_min = np.min(sv_values - sv_stds)
-        sv_y_max = np.max(sv_values + sv_stds)
-        sv_y_min = min(sv_y_min, sv_baseline)
-        sv_y_max = max(sv_y_max, sv_baseline)
-        
-        # Align baseline
-        below = sv_baseline - sv_y_min
-        above = sv_y_max - sv_baseline
-        total_range = max(below / baseline_axes_y, above / (1 - baseline_axes_y))
-        sv_y_min_aligned = sv_baseline - baseline_axes_y * total_range
-        sv_y_max_aligned = sv_baseline + (1 - baseline_axes_y) * total_range
-    else:
-        sv_baseline = None
-        sv_y_min_aligned = None
-        sv_y_max_aligned = None
-
-    # Calculate for difference features (baseline = 0)
-    if diff_feature_indices:
-        diff_baseline = 0
-        diff_values = stat_values[:, diff_feature_indices]
-        diff_stds = stds[:, diff_feature_indices]
-        diff_y_min = np.min(diff_values - diff_stds)
-        diff_y_max = np.max(diff_values + diff_stds)
-        diff_y_min = min(diff_y_min, diff_baseline)
-        diff_y_max = max(diff_y_max, diff_baseline)
-        
-        # Align baseline
-        below = diff_baseline - diff_y_min
-        above = diff_y_max - diff_baseline
-        total_range = max(below / baseline_axes_y, above / (1 - baseline_axes_y))
-        diff_y_min_aligned = diff_baseline - baseline_axes_y * total_range
-        diff_y_max_aligned = diff_baseline + (1 - baseline_axes_y) * total_range
-    else:
-        diff_baseline = None
-        diff_y_min_aligned = None
-        diff_y_max_aligned = None
-
-    # --- Plotting ---
-    fig, ax = plt.subplots(figsize=figsize)
-    x = np.arange(n_clusters)
-    width = 0.8 / n_features
-
-    # Create axes for each feature group
-    axes = []
-    ax_sv = None
-    ax_diff = None
-    
-    if sv_feature_indices:
-        ax_sv = ax
-        axes.append(('sv', ax_sv, sv_feature_indices))
-    
-    if diff_feature_indices:
-        if ax_sv is None:
-            ax_diff = ax
-        else:
-            ax_diff = ax.twinx()
-        axes.append(('diff', ax_diff, diff_feature_indices))
-
-    # Plot each feature group
-    for group_type, ax_feature, feature_indices in axes:
-        if group_type == 'sv':
-            baseline = sv_baseline
-            y_min, y_max = sv_y_min_aligned, sv_y_max_aligned
-            ylabel = 'Sv (dB)'
-        else:  # diff
-            baseline = diff_baseline
-            y_min, y_max = diff_y_min_aligned, diff_y_max_aligned
-            ylabel = 'Sv Difference (dB)'
-        
-        ax_feature.set_ylim(y_min, y_max)
-        ax_feature.set_ylabel(ylabel, fontsize=10)
-        
-        # Plot bars for all features in this group
-        for j in feature_indices:
-            feature_name = feature_coords[j]
-            offset = (j - n_features/2 + 0.5) * width
-            feature_values = stat_values[:, j]
-            feature_stds = stds[:, j]
-            
-            for i, (cluster_id, color) in enumerate(zip(cluster_ids, cluster_color_list)):
-                ax_feature.bar(
-                    x[i] + offset,
-                    feature_values[i] - baseline,
-                    width,
-                    yerr=feature_stds[i],
-                    bottom=baseline,
-                    color=color,
-                    alpha=1,
-                    capsize=3,
-                    edgecolor='black',
-                    linewidth=2
-                )
-        
-        # Draw baseline
-        ax_feature.axhline(
-            y=baseline,
-            color='black',
-            linestyle='-',
-            linewidth=2,
-            alpha=0.9,
-            zorder=0
-        )
-        
-        # Draw reference lines
-        if group_type == 'sv':
-            ax_feature.axhline(y=-80, color='black', linestyle=':', linewidth=2, alpha=0.7, zorder=1)
-            if ax_sv == ax:  # Only add grid to first axis
-                ax_feature.grid(True, alpha=0.3, linestyle='--', axis='y')
-        else:  # diff
-            ax_feature.axhline(y=3, color='blue', linestyle=':', linewidth=2, alpha=0.7, zorder=2)
-            ax_feature.axhline(y=-3, color='blue', linestyle=':', linewidth=2, alpha=0.7, zorder=2)
-
-
-    
-      # Feature legend (bar position markers)
-    feature_handles = []
-    feature_labels = []
-    for j, feature_name in enumerate(feature_coords):
-        feature_handles.append(Line2D([0], [0], marker='s', color='w', 
-                                     markerfacecolor='gray', markersize=8, 
-                                     markeredgecolor='black', linewidth=0))
-        feature_labels.append(str(feature_name))
-    
-    ax.set_xlabel('Cluster', fontsize=12)
-    if title is None:
-        if stat_type == 'mean':
-            title = f'Cluster Statistics (Mean ±1 SD): {cluster_data_name}\n{data_description}'
-        elif stat_type == 'min':
-            title = f'Cluster Statistics (Min, ±1 SD of mean): {cluster_data_name}\n{data_description}'
-        elif stat_type == 'max':
-            title = f'Cluster Statistics (Max, ±1 SD of mean): {cluster_data_name}\n{data_description}'
-    ax.set_title(title, fontsize=14, fontweight='bold')
-    ax.set_xticks(x)
-    ax.set_xticklabels([f'Cluster {cid}' if cid != -1 else 'Noise' for cid in cluster_ids], 
-                       rotation=45, ha='right')
-    
-    # Single column legend with full feature names
-    ax.legend(feature_handles, feature_labels, loc='upper center', bbox_to_anchor=(0.5, -0.15),
-             ncol=1, fontsize=8, title='Features', frameon=True)
-    
-    plt.tight_layout()
-    # Adjust bottom margin to accommodate vertical legend
-    bottom_margin = 0.2 + (n_features * 0.03)  # Add space per feature
-    plt.subplots_adjust(bottom=bottom_margin, right=0.88)
-    
-    
-    if save_path is not None:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"Figure saved to: {save_path}")
-    else:
-        plt.show()
-    
-    return fig, [ax_sv, ax_diff] if ax_diff else [ax_sv], stats_dict
-
-
-
 
 
 def remove_noise(
@@ -2335,20 +1442,17 @@ def reshape_and_normalize_data(
     """
     
     if cluster_colors is None:
-        cluster_colors = [
-                "#5A00CF", "#35E200", "#FF8800", "#F943FF", "#F30101", 
-                "#EDFF4D", "#4E9200", "#970021", "#5600C7", "#017685FF", "#0400FFFF"
-            ]
+        cluster_colors = DEFAULT_CLUSTER_COLORS
 
     cluster_mask_name = None
     # Exclude a specific cluster label (e.g. background from a previous pass)
     if mask_cluster_label is not None and gridded_results_to_mask is not None:
         cluster_mask_name = f'{exclude_cluster_data_name or "cluster"}_mask'
-        ds_Sv = add_cluster_label_mask(ds_Sv, gridded_results_to_mask, mask_cluster_label, mask_name=cluster_mask_name)
+        ds_Sv = add_cluster_mask(ds_Sv, gridded_results_to_mask, cluster_label=mask_cluster_label, mask_name=cluster_mask_name)
     elif exclude_cluster_data_name is not None and gridded_results_to_mask is not None:
         # Fallback: exclude the largest cluster
         cluster_mask_name = f'{exclude_cluster_data_name}_mask'
-        ds_Sv = add_largest_cluster_mask(ds_Sv, gridded_results_to_mask, mask_name=cluster_mask_name)
+        ds_Sv = add_cluster_mask(ds_Sv, gridded_results_to_mask, mask_name=cluster_mask_name)
 
     ds_ml_ready = reshape_data_for_ml(
         ds_Sv, 
@@ -2368,6 +1472,13 @@ def reshape_and_normalize_data(
             normalization_name=custom_normalization_name, 
             feature_weights=feature_weights,
             n_quantiles=n_quantiles
+        )
+        normalized_var = f"{custom_dataset_name}_{custom_normalization_name}"
+        source_data = ds_normalized[custom_dataset_name]
+        feature_dim = [d for d in source_data.dims if d != f'{custom_dataset_name}_sample_index'][0]
+        visualize_normalized_data_histogram(
+            ds_normalized[normalized_var].values,
+            feature_names=source_data.coords[feature_dim].values
         )
     else:
         ds_normalized = ds_ml_ready
@@ -2405,7 +1516,7 @@ def extract_data_and_run_hdbscan(
         sample_size=1000000,
         min_cluster_size=2000,
         cluster_selection_method="leaf",
-        useHDBScan=True,
+        use_hdbscan=True,
         find_background_cluster=False,
         y_to_x_aspect_ratio_override=None,
         soft_membership_threshold=None, 
@@ -2438,7 +1549,7 @@ def extract_data_and_run_hdbscan(
             Defaults to 2000.
         cluster_selection_method (str): HDBSCAN cluster-selection
             method. Defaults to 'leaf'.
-        useHDBScan (bool): Use HDBSCAN instead of DBSCAN.
+        use_hdbscan (bool): Use HDBSCAN instead of DBSCAN.
             Defaults to True.
         find_background_cluster (bool): Run background-cluster
             detection. Defaults to False.
@@ -2471,13 +1582,13 @@ def extract_data_and_run_hdbscan(
         dbscan_results = apply_dbscan_clustering(
             X,
             sample_indices=sample_indices,
-            eps_values=[epsilon], 
+            eps_values=[epsilon],
             min_samples_values=[min_samples],
-            sample_size=sample_size, 
+            sample_size=sample_size,
             calculate_silhouette=True,
             silhouette_sample_size=100,
             metric="euclidean",
-            useHDBScan=useHDBScan,
+            use_hdbscan=use_hdbscan,
             min_cluster_size=min_cluster_size,
             cluster_selection_method=cluster_selection_method,
             soft_membership_threshold=soft_membership_threshold
@@ -2512,7 +1623,7 @@ def extract_data_and_run_hdbscan(
 
     plot_cluster_statistics(ds_final, ml_result_name, dataset_name=custom_dataset_name, cluster_colors=cluster_colors, sv_data_var=cluster_stats_sv_data_var, compute_pairwise_diffs=cluster_stats_compute_pairwise_differences)
 
-    if useHDBScan and not find_background_cluster:
+    if use_hdbscan and not find_background_cluster:
         plot_dbscan_cluster_hierarchy(dbscan_results[first_key]["model"], cluster_colors_by_index=cluster_colors)
 
     if find_background_cluster:
@@ -2540,7 +1651,7 @@ def full_dbscan_iteration(
         sample_size=1000000,
         min_cluster_size=2000,
         cluster_selection_method="leaf",
-        useHDBScan=True,
+        use_hdbscan=True,
         exclude_cluster_data_name=None,
         gridded_results_to_mask=None,
         mask_cluster_label=None,
@@ -2587,7 +1698,7 @@ def full_dbscan_iteration(
             Defaults to 2000.
         cluster_selection_method (str): HDBSCAN method.
             Defaults to 'leaf'.
-        useHDBScan (bool): Use HDBSCAN. Defaults to True.
+        use_hdbscan (bool): Use HDBSCAN. Defaults to True.
         exclude_cluster_data_name (str or None): Previous cluster result
             name for exclusion masking.
         gridded_results_to_mask (xr.DataArray or None): Gridded cluster
@@ -2616,21 +1727,18 @@ def full_dbscan_iteration(
     """
     
     if cluster_colors is None:
-        cluster_colors = [
-                "#5A00CF", "#35E200", "#FF8800", "#F943FF", "#F30101", 
-                "#EDFF4D", "#4E9200", "#970021", "#5600C7", "#017685FF", "#0400FFFF"
-            ]
+        cluster_colors = DEFAULT_CLUSTER_COLORS
 
     cluster_mask_name = None
     # Exclude a specific cluster label (e.g. background from a previous pass)
     if mask_cluster_label is not None and gridded_results_to_mask is not None:
         cluster_mask_name = f'{exclude_cluster_data_name or "cluster"}_mask'
-        ds_Sv = add_cluster_label_mask(ds_Sv, gridded_results_to_mask, mask_cluster_label, mask_name=cluster_mask_name)
+        ds_Sv = add_cluster_mask(ds_Sv, gridded_results_to_mask, cluster_label=mask_cluster_label, mask_name=cluster_mask_name)
     elif exclude_cluster_data_name is not None and gridded_results_to_mask is not None:
         # Fallback: exclude the largest cluster
         cluster_mask_name = f'{exclude_cluster_data_name}_mask'
-        ds_Sv = add_largest_cluster_mask(ds_Sv, gridded_results_to_mask, mask_name=cluster_mask_name)
-    
+        ds_Sv = add_cluster_mask(ds_Sv, gridded_results_to_mask, mask_name=cluster_mask_name)
+
 
     ds_ml_ready = reshape_data_for_ml(
         ds_Sv, 
@@ -2650,6 +1758,13 @@ def full_dbscan_iteration(
             normalization_name=custom_normalization_name, 
             feature_weights=feature_weights,
             n_quantiles=n_quantiles
+        )
+        normalized_var = f"{custom_dataset_name}_{custom_normalization_name}"
+        source_data = ds_normalized[custom_dataset_name]
+        feature_dim = [d for d in source_data.dims if d != f'{custom_dataset_name}_sample_index'][0]
+        visualize_normalized_data_histogram(
+            ds_normalized[normalized_var].values,
+            feature_names=source_data.coords[feature_dim].values
         )
     else:
         ds_normalized = ds_ml_ready
@@ -2681,7 +1796,7 @@ def full_dbscan_iteration(
         sample_size=sample_size,
         min_cluster_size=min_cluster_size,
         cluster_selection_method=cluster_selection_method,
-        useHDBScan=useHDBScan,
+        use_hdbscan=use_hdbscan,
         find_background_cluster=find_background_cluster,
         y_to_x_aspect_ratio_override=y_to_x_aspect_ratio_override,
         soft_membership_threshold=soft_membership_threshold, 
@@ -2691,160 +1806,4 @@ def full_dbscan_iteration(
         cluster_stats_compute_pairwise_differences=cluster_stats_compute_pairwise_differences
         )
 
-
-
-
-def retrieve_background_cluster(X, sample_indices, min_samples, sample_size, min_cluster_size, cluster_selection_method,
-                                feature_threshold=-0.2, min_fraction=0.1):
-    """Find a background cluster by iterating over epsilon values.
-
-    Returns the clustering results and the label of the identified
-    background cluster.  A cluster qualifies as background if:
-
-    1. Its average ``feature[0]`` is below *feature_threshold*.
-    2. It contains more than *min_fraction* of total labelled samples.
-
-    Among qualifying clusters the largest one is selected.
-
-    Args:
-        X (np.ndarray): Feature matrix.
-        sample_indices (np.ndarray): Grid-index values for each row.
-        min_samples (int): Core-point neighbourhood size.
-        sample_size (int): Sub-sample size.
-        min_cluster_size (int): Minimum cluster size.
-        cluster_selection_method (str): HDBSCAN cluster selection method.
-        feature_threshold (float): Maximum average ``feature[0]`` for a
-            cluster to qualify as background. Defaults to -0.2.
-        min_fraction (float): Minimum fraction of total labelled samples
-            a cluster must contain. Defaults to 0.1.
-
-    Returns:
-        tuple: ``(dbscan_results, background_label)``.
-
-    Raises:
-        ValueError: If no qualifying background cluster is found across
-            all epsilon values.
-    """
-    for epsilon in [0.05, .06, .07, .08, .09, .1, .2, .3, .4, .5]:
-        print(f"Trying to find background cluster with eps={epsilon}")  
-        dbscan_results = apply_dbscan_clustering(
-                X,
-                sample_indices=sample_indices,
-                eps_values=[epsilon], 
-                min_samples_values=[min_samples],
-                sample_size=sample_size, 
-                calculate_silhouette=True,
-                silhouette_sample_size=100,
-                metric="euclidean",
-                useHDBScan=False,
-                min_cluster_size=min_cluster_size,
-                cluster_selection_method=cluster_selection_method
-            )
-        
-        first_key = next(iter(dbscan_results))
-        labels = dbscan_results[first_key]["labels"]
-        used_sample_indices = dbscan_results[first_key]["sample_indices"]
-        unique_labels, counts = np.unique(labels, return_counts=True)
-        valid_mask = unique_labels >= 0
-        valid_labels = unique_labels[valid_mask]
-        valid_counts = counts[valid_mask]
-
-        if len(valid_labels) == 0:
-            continue
-
-        total_samples = len(labels)
-
-        # Map grid indices back to positional indices in X
-        grid_idx_to_pos = {gi: pos for pos, gi in enumerate(sample_indices)}
-        sample_positions = np.array([grid_idx_to_pos[gi] for gi in used_sample_indices])
-        X_sample = X[sample_positions]
-
-        # Iterate over all clusters and collect qualifying background candidates
-        candidates = []  # list of (label, count, avg_feature0)
-        for i, label in enumerate(valid_labels):
-            count = valid_counts[i]
-            fraction = count / total_samples
-            cluster_mask = labels == label
-            avg_feature0 = np.mean(X_sample[cluster_mask, 0])
-            print(f"  Cluster {label}: avg feature[0] = {avg_feature0:.2f}, "
-                  f"size = {count:,} ({fraction:.1%} of total)")
-            if avg_feature0 < feature_threshold and fraction > min_fraction:
-                candidates.append((label, count, avg_feature0))
-
-        if candidates:
-            # Pick the largest qualifying candidate
-            best = max(candidates, key=lambda c: c[1])
-            background_label = best[0]
-            print(f"Found background cluster {background_label} with avg feature[0] = {best[2]:.2f}, "
-                  f"size = {best[1]:,} at eps={epsilon}")
-            return dbscan_results, background_label
-
-    raise ValueError(f"Could not find background cluster with avg feature[0] < {feature_threshold} "
-                     f"and > {min_fraction:.0%} of total samples")
-
-
-def plot_dbscan_cluster_hierarchy(model, cluster_colors_by_index=None):
-    """Plot HDBSCAN condensed tree with colours matching cluster labels.
-
-    Args:
-        model (hdbscan.HDBSCAN): Fitted HDBSCAN model.
-        cluster_colors_by_index (list[str] or None): Hex colour strings
-            indexed by cluster label. A default palette is used when
-            ``None``.
-
-    Returns:
-        tuple: ``(label_to_tree, palette_by_tree_order)`` — mapping from
-        final cluster label to condensed-tree cluster id, and colour
-        palette ordered by tree cluster id.
-    """
-    if cluster_colors_by_index is None:
-        cluster_colors_by_index = [
-            "#00F3FC", "#35E200", "#0400FF", "#F943FF", "#F30101", 
-            "#EDFF4D", "#4E9200", "#970021", "#5600C7", "#017685FF", "#FFA600FF"
-        ]
-    
-    final_labels = model.labels_
-    selected_clusters = model.condensed_tree_._select_clusters()
-    unique_labels = sorted([l for l in set(final_labels) if l != -1])
-    
-    # Ensure we have enough colors for all clusters
-    max_label = max(unique_labels) if unique_labels else 0
-    if len(cluster_colors_by_index) <= max_label:
-        num_additional_colors = max_label - len(cluster_colors_by_index) + 1
-        hue_offset = 0.3
-        additional_colors = utils.generate_colors(hue_offset, num_additional_colors)
-        cluster_colors_by_index = cluster_colors_by_index + additional_colors
-        print(f"Warning: Generated {num_additional_colors} additional colors for clusters beyond base palette")
-    
-    # HDBSCAN assigns final labels in sorted order of selected tree clusters
-    label_to_tree = {}
-    sorted_tree_clusters = sorted(selected_clusters)
-    
-    for final_label in unique_labels:
-        label_to_tree[final_label] = sorted_tree_clusters[final_label]
-    
-    # Build palette in tree cluster order (required by condensed_tree_.plot)
-    palette_by_tree_order = []
-    for idx, tree_cluster in enumerate(sorted_tree_clusters):
-        final_label = list(label_to_tree.keys())[list(label_to_tree.values()).index(tree_cluster)]
-        color = cluster_colors_by_index[final_label]
-        palette_by_tree_order.append(color)
-    
-    # Plot with correct color mapping
-    ax = model.condensed_tree_.plot(select_clusters=True, selection_palette=palette_by_tree_order)
-    # Fix HDBSCAN/matplotlib compatibility: Ellipse patches may have array-valued
-    # width/height which newer numpy (>=2.0) rejects during rendering.
-    from matplotlib.patches import Ellipse as _Ellipse
-    for patch in ax.patches:
-        if isinstance(patch, _Ellipse):
-            if isinstance(patch._width, np.ndarray):
-                patch._width = patch._width.item()
-            if isinstance(patch._height, np.ndarray):
-                patch._height = patch._height.item()
-            if isinstance(getattr(patch, '_center', None), np.ndarray):
-                patch._center = tuple(float(c) for c in patch._center)
-    plt.title('HDBSCAN Condensed Tree')
-    plt.show()
-    
-    return label_to_tree, palette_by_tree_order
 
