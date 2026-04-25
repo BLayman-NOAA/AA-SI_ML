@@ -326,8 +326,8 @@ def extract_ml_data_flattened(ds_ml_ready, data_var='Sv', mask_name='valid_mask'
 
     if feature_strategy == 'channels':
         feature_data = raw_data_values
-        feature_coords = data.coords['channel']
-        feature_dim_name = 'channel'
+        feature_coords = np.array([str(ch) for ch in data.coords['channel'].values], dtype=str)
+        feature_dim_name = f'feature_{dataset_name}'
 
     elif feature_strategy == 'baseline_plus_differences':
         if baseline_channel >= raw_data_values.shape[1]:
@@ -556,52 +556,353 @@ def reshape_data_for_ml(ds_Sv, data_var='Sv_corrected', dataset_name='ml_data_cl
     return ds_ml_ready
 
 
+def add_auxiliary_features(ds_ml_ready, dataset_name='ml_data_clean', features=None, echodata=None):
+    """Append auxiliary coordinate-derived features to the flattened ML dataset.
+
+    Slots between :func:`reshape_data_for_ml` and :func:`normalize_data` in
+    the pipeline.  Built-in feature names are ``'depth'``,
+    ``'ping_time_seconds'``, ``'seafloor_depth'``, and ``'altitude'``.
+    User-defined features are supported via callable dicts.
+
+    Args:
+        ds_ml_ready (xr.Dataset): Dataset produced by
+            :func:`reshape_data_for_ml`.
+        dataset_name (str): Base ML dataset name.  Defaults to
+            ``'ml_data_clean'``.
+        features (list or None): Features to append.  Each element is
+            either a ``str`` naming a built-in feature or a ``dict`` of
+            the form ``{'name': str, 'func': callable}`` for a
+            user-defined feature.  The callable receives
+            ``(ds_ml_ready, ping_indices, range_indices)`` and must
+            return a 1-D :class:`numpy.ndarray` of shape
+            ``(n_samples,)``.  When ``None`` the function is a no-op.
+        echodata: EchoData object providing
+            ``echodata["Vendor_specific"]["detected_seafloor_depth"]``
+            (dims ``channel × ping_time``).  Required when
+            ``'seafloor_depth'`` or ``'altitude'`` is requested.
+
+    Returns:
+        xr.Dataset: Dataset with auxiliary features appended to
+        ``dataset_name``.
+
+    Raises:
+        ValueError: If a requested built-in feature cannot be computed
+            from the available data.
+    """
+    if features is None:
+        return ds_ml_ready
+
+    SEAFLOOR_FEATURES = {'seafloor_depth', 'altitude'}
+    seafloor_requested = any(
+        (f if isinstance(f, str) else f.get('name', '')) in SEAFLOOR_FEATURES
+        for f in features
+    )
+    if seafloor_requested and echodata is None:
+        raise ValueError(
+            "'seafloor_depth' and 'altitude' require the 'echodata' parameter "
+            "to access detected_seafloor_depth from Vendor_specific data."
+        )
+
+    # --- Recover ping/range positions from the grid-index mapping ---
+    mapping_name = f'{dataset_name}_sample_index_to_grid_index'
+    if mapping_name not in ds_ml_ready:
+        raise ValueError(
+            f"Dataset missing '{mapping_name}'. Run reshape_data_for_ml() first."
+        )
+
+    grid_indices_flat = ds_ml_ready[mapping_name].values  # (n_samples,)
+
+    # Determine grid shape from the grid_index coordinate
+    grid_index_name = (
+        'grid_index'
+        if 'grid_index' in ds_ml_ready.coords
+        else f'grid_index_{dataset_name}'
+    )
+    grid_index_coord = ds_ml_ready[grid_index_name]
+    grid_coords = list(grid_index_coord.dims)  # [ping_dim, range_dim]
+    grid_shape = tuple(ds_ml_ready.sizes[d] for d in grid_coords)
+
+    ping_indices, range_indices = np.unravel_index(grid_indices_flat, grid_shape)
+
+    ping_dim = grid_coords[0]   # e.g. 'ping_time'
+    range_dim = grid_coords[1]  # e.g. 'range_sample' or 'echo_range'
+
+    # --- Pre-compute seafloor depth on the dataset's ping grid if needed ---
+    seafloor_on_grid = None
+    if seafloor_requested:
+        raw_sfd = echodata["Vendor_specific"]["detected_seafloor_depth"]
+        # raw_sfd dims: (channel, ping_time_raw)
+        # Average across channels, then resample to dataset ping times
+        sfd_mean = raw_sfd.mean(dim='channel')  # (ping_time_raw,)
+        ds_ping_times = ds_ml_ready[ping_dim]   # binned ping times
+        # Nearest-neighbour resampling
+        seafloor_on_grid = sfd_mean.sel(
+            ping_time=ds_ping_times, method='nearest'
+        ).values  # (n_pings_in_grid,)
+
+    # --- Build each auxiliary column ---
+    new_columns = []   # list of (name, np.ndarray shape (n_samples,))
+
+    for feature_spec in features:
+        if isinstance(feature_spec, str):
+            name = feature_spec
+        else:
+            name = feature_spec['name']
+
+        if name == 'depth':
+            if 'echo_range' not in ds_ml_ready:
+                raise ValueError(
+                    "'depth' feature requires 'echo_range' variable in the dataset. "
+                    "Ensure compute_Sv() has been called before reshape_data_for_ml()."
+                )
+            echo_range = ds_ml_ready['echo_range']
+            # echo_range dims: (channel, ping_dim, range_dim) — mean across channels
+            if 'channel' in echo_range.dims:
+                echo_range_2d = echo_range.mean(dim='channel')
+            else:
+                echo_range_2d = echo_range
+            if echo_range_2d.values.ndim == 1:
+                # MVBS case: echo_range IS the range coordinate (1D depth values)
+                values = echo_range_2d.values[range_indices]
+            else:
+                # Raw Sv case: echo_range is a (ping_dim, range_dim) variable
+                # Explicitly transpose to match grid_coords order before numpy indexing
+                echo_range_2d = echo_range_2d.transpose(ping_dim, range_dim)
+                values = echo_range_2d.values[ping_indices, range_indices]
+
+        elif name == 'ping_time_seconds':
+            ping_times_ns = ds_ml_ready[ping_dim].values.astype('float64')
+            t0 = ping_times_ns.min()
+            ping_times_sec = (ping_times_ns - t0) / 1e9
+            values = ping_times_sec[ping_indices]
+
+        elif name == 'seafloor_depth':
+            values = seafloor_on_grid[ping_indices]
+
+        elif name == 'altitude':
+            if 'echo_range' not in ds_ml_ready:
+                raise ValueError(
+                    "'altitude' feature requires 'echo_range' variable in the dataset."
+                )
+            echo_range = ds_ml_ready['echo_range']
+            if 'channel' in echo_range.dims:
+                echo_range_2d = echo_range.mean(dim='channel')
+            else:
+                echo_range_2d = echo_range
+            if echo_range_2d.values.ndim == 1:
+                depth_values = echo_range_2d.values[range_indices]
+            else:
+                echo_range_2d = echo_range_2d.transpose(ping_dim, range_dim)
+                depth_values = echo_range_2d.values[ping_indices, range_indices]
+            values = seafloor_on_grid[ping_indices] - depth_values
+
+        elif isinstance(feature_spec, dict) and 'func' in feature_spec:
+            values = feature_spec['func'](ds_ml_ready, ping_indices, range_indices)
+            if not isinstance(values, np.ndarray) or values.ndim != 1 or len(values) != len(ping_indices):
+                raise ValueError(
+                    f"Custom feature function for '{name}' must return a 1-D ndarray "
+                    f"of length {len(ping_indices)}, got shape {getattr(values, 'shape', 'unknown')}."
+                )
+        else:
+            raise ValueError(
+                f"Unknown built-in feature '{name}'. Supported built-ins are: "
+                "'depth', 'ping_time_seconds', 'seafloor_depth', 'altitude'. "
+                "For custom features provide a dict with 'name' and 'func' keys."
+            )
+
+        new_columns.append((name, values.astype(np.float64)))
+        logger.info("Computed auxiliary feature '%s' with shape %s.", name, values.shape)
+
+    # --- Concatenate onto existing DataArray ---
+    source_da = ds_ml_ready[dataset_name]
+    sample_dim = f'{dataset_name}_sample_index'
+    feature_dim = f'feature_{dataset_name}'
+
+    existing_data = source_da.values          # (n_samples, n_existing_features)
+    existing_coords = list(source_da.coords[feature_dim].values)
+
+    new_data = np.stack([col for _, col in new_columns], axis=1)   # (n_samples, n_new)
+    new_coord_labels = [name for name, _ in new_columns]
+
+    combined_data = np.concatenate([existing_data, new_data], axis=1)
+    combined_coords = existing_coords + new_coord_labels
+
+    updated_da = xr.DataArray(
+        combined_data,
+        dims=[sample_dim, feature_dim],
+        coords={
+            sample_dim: source_da.coords[sample_dim],
+            feature_dim: np.array(combined_coords, dtype=str),
+        },
+        attrs=source_da.attrs.copy(),
+    )
+
+    # Track auxiliary feature names for normalize_data warnings
+    existing_aux = list(updated_da.attrs.get('auxiliary_features', []))
+    updated_da.attrs['auxiliary_features'] = existing_aux + new_coord_labels
+
+    # Drop the old variable and its stale dimension coordinate before assigning.
+    # Without this, xarray silently reindexes the new DataArray against the
+    # existing feature coordinate (which has fewer entries), discarding the
+    # newly added auxiliary columns.
+    if dataset_name in ds_ml_ready:
+        ds_ml_ready = ds_ml_ready.drop_vars(dataset_name)
+    if feature_dim in ds_ml_ready.coords:
+        ds_ml_ready = ds_ml_ready.drop_vars(feature_dim)
+
+    ds_ml_ready[dataset_name] = updated_da
+
+    logger.info(
+        "Added %d auxiliary feature(s) to '%s': %s. New shape: %s.",
+        len(new_columns), dataset_name, new_coord_labels, updated_da.shape,
+    )
+
+    return ds_ml_ready
+
+
+def _build_scaler(method, X, n_quantiles=100, flatten_weight=1):
+    """Fit and apply a named scaler to array X.  Returns (X_normalized, scaler).
+
+    Handles all methods supported by normalize_data except 'l2' and global
+    variants (those are handled inline).  ``X`` must already be the column
+    subset that this scaler should act on.
+    """
+    if method == 'standard':
+        scaler = StandardScaler()
+    elif method == 'robust':
+        scaler = RobustScaler()
+    elif method == 'minmax':
+        scaler = MinMaxScaler()
+    elif method in ('flatten', 'power', 'flatten_plus_umap'):
+        scaler = PowerTransformer(method='yeo-johnson', standardize=True)
+    elif method == 'quantile':
+        n_q = min(len(X), n_quantiles)
+        scaler = QuantileTransformer(output_distribution='uniform', n_quantiles=n_q)
+    elif method == 'umap':
+        n_components = 2
+        scaler = umap.UMAP(
+            n_components=n_components,
+            n_neighbors=15,
+            min_dist=0.1,
+            metric='euclidean',
+            random_state=42,
+            verbose=True,
+        )
+        X = StandardScaler().fit_transform(X)
+    else:
+        raise ValueError(f"Unknown normalization method: '{method}'")
+
+    X_out = scaler.fit_transform(X)
+
+    if method in ('flatten', 'flatten_plus_umap'):
+        X_flattened = norm.cdf(X_out)
+        X_out = (1 - flatten_weight) * X_out + flatten_weight * X_flattened
+        if method == 'flatten_plus_umap':
+            umap_scaler = umap.UMAP(
+                n_components=2,
+                n_neighbors=30,
+                min_dist=0.1,
+                metric='euclidean',
+                random_state=42,
+                verbose=True,
+            )
+            X_out = umap_scaler.fit_transform(X_out)
+
+    return X_out, scaler
+
+
 def normalize_data(ds_ml_ready, method='standard', pre_l2_method='standard',
                   shift_positive=False, per_feature=True, dataset_name='ml_data_clean',
-                  normalization_name=None, feature_weights=None, n_quantiles=100, flatten_weight=1):
+                  normalization_name=None, feature_weights=None, n_quantiles=100,
+                  flatten_weight=1, per_group_methods=None):
     """Normalize flattened ML data using a variety of scaling methods.
 
     Supports per-feature and global normalization, optional L2 row
     normalization with a configurable pre-scaler, power-transform
-    flattening, UMAP embedding, and feature weighting.
+    flattening, UMAP embedding, feature weighting, and per-group method
+    overrides for auxiliary features.
 
     Args:
         ds_ml_ready (xr.Dataset): Dataset produced by reshape_data_for_ml.
-        method (str): Normalization method. One of 'standard', 'robust',
-            'minmax', 'flatten', 'power', 'quantile', 'umap',
-            'flatten_plus_umap', or 'l2'. Defaults to 'standard'.
+        method (str): Default normalization method applied to all Sv-derived
+            features (i.e. features not listed in *per_group_methods*). One
+            of 'standard', 'robust', 'minmax', 'flatten', 'power',
+            'quantile', 'umap', 'flatten_plus_umap', or 'l2'.
+            Defaults to 'standard'.
         pre_l2_method (str): Scaler applied before L2 normalization when
             method is 'l2'. Defaults to 'standard'.
         shift_positive (bool): Shift all values to be positive after
             normalization. Defaults to False.
-        per_feature (bool): Normalize each feature independently.
+        per_feature (bool): When True, normalize each Sv-group feature
+            independently; when False, use a single global scaler pooled
+            across all Sv-group features.  Does not affect per-group
+            auxiliary columns, which are always normalized per-column.
             Defaults to True.
         dataset_name (str): Base dataset name. Defaults to 'ml_data_clean'.
         normalization_name (str or None): Suffix for the stored result.
             Defaults to the method name.
         feature_weights (array-like or None): Per-feature multiplicative
-            weights. Defaults to None.
+            weights applied after normalization. Length must match the total
+            number of features. Defaults to None.
         n_quantiles (int): Number of quantiles for 'quantile' method.
             Defaults to 100.
-        flatten_weight (float): Blending weight for 'flatten' method's CDF transform.
+        flatten_weight (float): Blending weight for 'flatten' method's CDF
+            transform. Defaults to 1.
+        per_group_methods (dict[str, str] or None): Mapping of feature label
+            to normalization method for auxiliary features that should be
+            normalized differently from the Sv group.  Features not listed
+            here fall back to *method*.  A warning is emitted for any
+            auxiliary feature (tracked via ``attrs['auxiliary_features']``)
+            that is not listed.  Example::
 
+                per_group_methods={
+                    'depth': 'minmax',
+                    'ping_time_seconds': 'minmax',
+                }
+
+            Defaults to None (all features use *method*).
 
     Returns:
         xr.Dataset: Dataset with the normalized data added.
     """
-    # Set default normalization_name based on method
+    # --- Default normalization_name ---
     if normalization_name is None:
         if method == 'l2':
             normalization_name = f'l2_{pre_l2_method}_normalized' if pre_l2_method != 'none' else 'l2_normalized'
         else:
             normalization_name = f'{method}_normalized'
-    
+
     X_clean, _, _ = extract_valid_samples_for_sklearn(ds_ml_ready, specific_data_name='', dataset_name=dataset_name)
 
+    source_data = ds_ml_ready[dataset_name]
+    feature_dim_name = [dim for dim in source_data.dims if dim != f'{dataset_name}_sample_index'][0]
+    all_feature_labels = list(source_data.coords[feature_dim_name].values)
+    auxiliary_features = list(source_data.attrs.get('auxiliary_features', []))
+
+    # --- Warn for auxiliary features not covered by per_group_methods ---
+    if per_group_methods is not None and auxiliary_features:
+        for aux_name in auxiliary_features:
+            if aux_name not in per_group_methods:
+                logger.warning(
+                    "Auxiliary feature '%s' is not listed in per_group_methods and will "
+                    "be normalized with the default method '%s'. Specify it explicitly "
+                    "in per_group_methods to suppress this warning.",
+                    aux_name, method,
+                )
+
+    # --- Identify column indices for Sv group vs per-group overrides ---
+    per_group_methods = per_group_methods or {}
+    sv_col_indices = [i for i, lbl in enumerate(all_feature_labels) if lbl not in per_group_methods]
+    group_col_map = {lbl: i for i, lbl in enumerate(all_feature_labels) if lbl in per_group_methods}
+
+    X_sv = X_clean[:, sv_col_indices]  # columns handled by default method / global
+
+    # ------------------------------------------------------------------ #
+    #  Normalize the Sv group                                             #
+    # ------------------------------------------------------------------ #
     if per_feature:
         if method == 'l2':
-            # L2 normalization with optional pre-normalization
-            if pre_l2_method == 'standard' or pre_l2_method == 'standard_shifted':
+            if pre_l2_method in ('standard', 'standard_shifted'):
                 pre_scaler = StandardScaler()
             elif pre_l2_method == 'robust':
                 pre_scaler = RobustScaler()
@@ -612,166 +913,133 @@ def normalize_data(ds_ml_ready, method='standard', pre_l2_method='standard',
             else:
                 raise ValueError(f"Unknown pre_l2_method: {pre_l2_method}")
 
-            if pre_scaler:
-                pre_normalized = pre_scaler.fit_transform(X_clean)
-            else:
-                pre_normalized = X_clean
-
+            pre_normalized = pre_scaler.fit_transform(X_sv) if pre_scaler else X_sv
             if pre_l2_method == 'standard_shifted':
-                pre_normalized = pre_normalized + 2  # Shift 2 SDs
-
-            scaler = Normalizer(norm='l2')
-            X_normalized = scaler.fit_transform(pre_normalized)
+                pre_normalized = pre_normalized + 2
+            sv_scaler = Normalizer(norm='l2')
+            X_sv_normalized = sv_scaler.fit_transform(pre_normalized)
 
             normalization_info = {
                 'method': method,
                 'pre_l2_method': pre_l2_method,
                 'per_frequency': per_feature,
-                'shift_positive': shift_positive
+                'shift_positive': shift_positive,
             }
         else:
-            # Standard scalers - per frequency normalization
-            if method == 'standard':
-                scaler = StandardScaler()
-            elif method == 'robust':
-                scaler = RobustScaler()
-            elif method == 'minmax':
-                scaler = MinMaxScaler()
-            elif method == 'flatten' or method == "power" or method == 'flatten_plus_umap':
-                scaler = PowerTransformer(method='yeo-johnson', standardize=True)
-            elif method == 'quantile':
-                n_quantiles = min(len(X_clean), n_quantiles)
-                scaler = QuantileTransformer(output_distribution='uniform', n_quantiles=n_quantiles)
-            elif method == 'umap':
-
-                n_components = 2
-                # Initialize and fit UMAP
-                scaler = umap.UMAP(
-                    n_components=n_components,
-                    n_neighbors=15,
-                    min_dist=.1,
-                    metric="euclidean",
-                    random_state=42,
-                    verbose=True
-                )
-                # perform standard normalization before UMAP
-                X_clean = StandardScaler().fit_transform(X_clean)
-                
-            else:
-                raise ValueError(f"Unknown normalization method: {method}")
-            
-            X_normalized = scaler.fit_transform(X_clean)
-
-            if method == 'flatten' or method == 'flatten_plus_umap':
-                X_flattened = norm.cdf(X_normalized)
-                X_normalized = (1 - flatten_weight) * X_normalized + flatten_weight * X_flattened
-
-                if method == 'flatten_plus_umap':
-                    n_components = 2
-                    # Initialize and fit UMAP
-                    umap_scaler = umap.UMAP(
-                        n_components=n_components,
-                        n_neighbors=30,
-                        min_dist=.1,
-                        metric="euclidean",
-                        random_state=42,
-                        verbose=True
-                    )
-                    X_normalized = umap_scaler.fit_transform(X_normalized)
-
-            
+            X_sv_normalized, sv_scaler = _build_scaler(
+                method, X_sv, n_quantiles=n_quantiles, flatten_weight=flatten_weight
+            )
             normalization_info = {
                 'method': method,
                 'per_frequency': per_feature,
                 'shift_positive': shift_positive,
-                'feature_means': scaler.mean_ if hasattr(scaler, 'mean_') else None,
-                'feature_scales': scaler.scale_ if hasattr(scaler, 'scale_') else None
+                'feature_means': sv_scaler.mean_ if hasattr(sv_scaler, 'mean_') else None,
+                'feature_scales': sv_scaler.scale_ if hasattr(sv_scaler, 'scale_') else None,
             }
     else:
-        # Global normalization across all features
-        logger.info("Using global normalization (treating all features together).")
-        
-        X_flat = X_clean.flatten()
-        
+        # Global normalization — pool all Sv-group columns together
+        logger.info("Using global normalization on Sv group (%d columns).", len(sv_col_indices))
+        X_flat = X_sv.flatten()
+
         if method == 'standard':
             global_mean = np.mean(X_flat)
             global_std = np.std(X_flat)
-            X_normalized = (X_clean - global_mean) / global_std
+            X_sv_normalized = (X_sv - global_mean) / global_std
             normalization_info = {
-                'method': 'standard_global',
-                'per_frequency': per_feature,
+                'method': 'standard_global', 'per_frequency': per_feature,
                 'shift_positive': shift_positive,
-                'global_mean': global_mean,
-                'global_std': global_std
+                'global_mean': global_mean, 'global_std': global_std,
             }
         elif method == 'robust':
             global_median = np.median(X_flat)
-            global_q25 = np.percentile(X_flat, 25)
-            global_q75 = np.percentile(X_flat, 75)
-            global_iqr = global_q75 - global_q25
-            X_normalized = (X_clean - global_median) / global_iqr
+            global_iqr = np.percentile(X_flat, 75) - np.percentile(X_flat, 25)
+            X_sv_normalized = (X_sv - global_median) / global_iqr
             normalization_info = {
-                'method': 'robust_global',
-                'per_frequency': per_feature,
+                'method': 'robust_global', 'per_frequency': per_feature,
                 'shift_positive': shift_positive,
-                'global_median': global_median,
-                'global_iqr': global_iqr
+                'global_median': global_median, 'global_iqr': global_iqr,
             }
         elif method == 'minmax':
             global_min = np.min(X_flat)
-            global_max = np.max(X_flat)
-            global_range = global_max - global_min
-            X_normalized = (X_clean - global_min) / global_range
+            global_range = np.max(X_flat) - global_min
+            X_sv_normalized = (X_sv - global_min) / global_range
             normalization_info = {
-                'method': 'minmax_global',
-                'per_frequency': per_feature,
+                'method': 'minmax_global', 'per_frequency': per_feature,
                 'shift_positive': shift_positive,
-                'global_min': global_min,
-                'global_range': global_range
+                'global_min': global_min, 'global_range': global_range,
             }
+        else:
+            raise ValueError(
+                f"Global normalization (per_feature=False) only supports "
+                f"'standard', 'robust', and 'minmax', not '{method}'."
+            )
 
-    # Apply positive shift if requested
+    # ------------------------------------------------------------------ #
+    #  Normalize per-group auxiliary columns                              #
+    # ------------------------------------------------------------------ #
+    # We'll reconstruct X_normalized column-by-column in original order
+    X_normalized = np.empty_like(X_clean)
+    for out_idx, sv_idx in enumerate(sv_col_indices):
+        X_normalized[:, sv_idx] = X_sv_normalized[:, out_idx]
+
+    for feature_label, col_idx in group_col_map.items():
+        aux_method = per_group_methods[feature_label]
+        col = X_clean[:, col_idx:col_idx + 1]
+        col_normalized, _ = _build_scaler(
+            aux_method, col, n_quantiles=n_quantiles, flatten_weight=flatten_weight
+        )
+        X_normalized[:, col_idx] = col_normalized[:, 0]
+        logger.info(
+            "Normalized auxiliary feature '%s' with method '%s'.",
+            feature_label, aux_method,
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Post-processing: shift and weights                                 #
+    # ------------------------------------------------------------------ #
     if shift_positive:
         min_value = X_normalized.min()
         if min_value < 0:
             X_normalized = X_normalized + abs(min_value) + 1e-6
             normalization_info['shift_amount'] = abs(min_value) + 1e-6
 
-    # Apply feature weights
     if feature_weights is not None and per_feature:
         if len(feature_weights) != X_normalized.shape[1]:
-            raise ValueError(f"feature_weights length ({len(feature_weights)}) must match number of features ({X_normalized.shape[1]})")
+            raise ValueError(
+                f"feature_weights length ({len(feature_weights)}) must match "
+                f"number of features ({X_normalized.shape[1]})"
+            )
         X_normalized = X_normalized * feature_weights
         normalization_info['feature_weights'] = feature_weights
         logger.info("Applied feature weights: %s", feature_weights)
 
     if not per_feature and method != 'l2':
-        scope = 'global (across all features)'
+        scope = 'global across Sv features'
     elif method != 'l2':
         scope = 'per-feature (each feature independently)'
     else:
         scope = 'per-sample (L2 unit vectors)'
     logger.info("Normalization method: %s, scope: %s", method, scope)
+    if group_col_map:
+        logger.info("Per-group overrides: %s", {k: per_group_methods[k] for k in group_col_map})
     logger.info("Original data range: %.2f to %.2f", X_clean.min(), X_clean.max())
     logger.info("Normalized data range: %.2f to %.2f", X_normalized.min(), X_normalized.max())
     logger.debug("Normalized mean per feature: %s", X_normalized.mean(axis=0))
     logger.debug("Normalized std per feature: %s", X_normalized.std(axis=0))
 
-    # Store in dataset using the source data's coordinate system
+    # ------------------------------------------------------------------ #
+    #  Store result                                                       #
+    # ------------------------------------------------------------------ #
     source_sample_index_coord_name = f'{dataset_name}_sample_index'
     normalized_data_name = f'{dataset_name}_{normalization_name}'
-    
-    source_data = ds_ml_ready[dataset_name]
-    feature_dim_name = [dim for dim in source_data.dims if dim != f'{dataset_name}_sample_index'][0]
-    
-    # Store normalized data
+
     ml_data_normalized = xr.DataArray(
         X_normalized,
         dims=[source_sample_index_coord_name, feature_dim_name],
         coords={
             source_sample_index_coord_name: ds_ml_ready[dataset_name].coords[source_sample_index_coord_name],
-            feature_dim_name: ds_ml_ready[dataset_name].coords[feature_dim_name]
-        }
+            feature_dim_name: ds_ml_ready[dataset_name].coords[feature_dim_name],
+        },
     )
 
     ds_ml_ready[normalized_data_name] = ml_data_normalized
@@ -1396,7 +1664,8 @@ def reshape_and_normalize_data(
         mask_cluster_label=None,
         y_to_x_aspect_ratio_override=None,
         n_quantiles=100,
-        cluster_colors=None
+        cluster_colors=None,
+        per_group_methods=None
         ):
     """Reshape data, normalize, and plot in a single convenience call.
 
@@ -1435,6 +1704,9 @@ def reshape_and_normalize_data(
             normalization. Defaults to 100.
         cluster_colors (list[str] or None): Hex colours for cluster
             display.
+        per_group_methods (dict[str, str] or None): Per-feature method
+            overrides for auxiliary features. Forwarded to
+            :func:`normalize_data`. Defaults to None.
 
     Returns:
         xr.Dataset: Dataset with reshaped and (optionally) normalized
@@ -1471,7 +1743,8 @@ def reshape_and_normalize_data(
             dataset_name=custom_dataset_name, 
             normalization_name=custom_normalization_name, 
             feature_weights=feature_weights,
-            n_quantiles=n_quantiles
+            n_quantiles=n_quantiles,
+            per_group_methods=per_group_methods,
         )
         normalized_var = f"{custom_dataset_name}_{custom_normalization_name}"
         source_data = ds_normalized[custom_dataset_name]
@@ -1499,8 +1772,6 @@ def reshape_and_normalize_data(
     )
 
     return ds_normalized
-
-
 
 
 
@@ -1632,8 +1903,6 @@ def extract_data_and_run_hdbscan(
 
 
 
-
-
 def full_dbscan_iteration(
         ds_Sv,
         custom_dataset_name, 
@@ -1662,7 +1931,8 @@ def full_dbscan_iteration(
         cluster_colors=None,
         overlay_line_var=None,
         cluster_stats_sv_data_var="Sv",
-        cluster_stats_compute_pairwise_differences=True
+        cluster_stats_compute_pairwise_differences=True,
+        per_group_methods=None
         ):
     """End-to-end iteration: reshape, normalize, cluster, and visualise.
 
@@ -1719,6 +1989,9 @@ def full_dbscan_iteration(
             Defaults to 'Sv'.
         cluster_stats_compute_pairwise_differences (bool): Compute
             pairwise channel diffs in statistics. Defaults to True.
+        per_group_methods (dict[str, str] or None): Per-feature method
+            overrides for auxiliary features. Forwarded to
+            :func:`normalize_data`. Defaults to None.
 
     Returns:
         tuple: ``(ds_final, gridded_results, dbscan_results)`` or
@@ -1757,7 +2030,8 @@ def full_dbscan_iteration(
             dataset_name=custom_dataset_name, 
             normalization_name=custom_normalization_name, 
             feature_weights=feature_weights,
-            n_quantiles=n_quantiles
+            n_quantiles=n_quantiles,
+            per_group_methods=per_group_methods,
         )
         normalized_var = f"{custom_dataset_name}_{custom_normalization_name}"
         source_data = ds_normalized[custom_dataset_name]
