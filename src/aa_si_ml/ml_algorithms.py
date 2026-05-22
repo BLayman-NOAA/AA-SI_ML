@@ -13,6 +13,8 @@ from .plotting_and_logging import print_basic_cluster_stats
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_MIN_CLUSTER_SIZE_FRACTION = 0.03
+
 
 def _subsample_data(X, sample_indices, sample_size, algorithm_name):
     """Return a random subsample of X and sample_indices, or the originals.
@@ -50,7 +52,8 @@ def apply_dbscan_clustering(
         metric="euclidean",
         algorithm="auto",
         use_hdbscan=False,
-        min_cluster_size=5,
+        min_cluster_size=None,
+        min_cluster_size_fraction=None,
         cluster_selection_method='eom',
         soft_membership_threshold=None
         ):
@@ -79,8 +82,13 @@ def apply_dbscan_clustering(
         algorithm (str): DBSCAN algorithm variant. Defaults to 'auto'.
         use_hdbscan (bool): Use HDBSCAN instead of DBSCAN.
             Defaults to False.
-        min_cluster_size (int): Minimum cluster size (HDBSCAN parameter /
-            DBSCAN post-filter). Defaults to 5.
+        min_cluster_size (int or None): Absolute minimum cluster size
+            (HDBSCAN parameter / DBSCAN post-filter). Mutually exclusive
+            with min_cluster_size_fraction. Defaults to None.
+        min_cluster_size_fraction (float or None): Fraction of input data
+            points used to derive min_cluster_size when an absolute
+            size is not provided. When None, defaults to 0.03. Defaults
+            to None.
         cluster_selection_method (str): HDBSCAN cluster selection method.
             Defaults to 'eom'.
         soft_membership_threshold (float or None): If set, reassign
@@ -95,6 +103,11 @@ def apply_dbscan_clustering(
     algorithm_name = "HDBSCAN" if use_hdbscan else "DBSCAN"
     X_sample, used_sample_indices = _subsample_data(
         X_normalized, sample_indices, sample_size, algorithm_name
+    )
+    min_cluster_size = _resolve_min_cluster_size(
+        min_cluster_size,
+        len(X_normalized),
+        min_cluster_size_fraction=min_cluster_size_fraction,
     )
 
     results = {}
@@ -114,6 +127,25 @@ def apply_dbscan_clustering(
         )
 
     return results
+
+
+def _resolve_min_cluster_size(
+        min_cluster_size,
+        n_data_points,
+        min_cluster_size_fraction=None,
+        ):
+    """Return the absolute cluster size, deriving it from a fraction if needed."""
+    if min_cluster_size is not None and min_cluster_size_fraction is not None:
+        raise ValueError(
+            "Provide either min_cluster_size or min_cluster_size_fraction, not both."
+        )
+    if min_cluster_size is not None:
+        return min_cluster_size
+
+    fraction = min_cluster_size_fraction if min_cluster_size_fraction is not None else _DEFAULT_MIN_CLUSTER_SIZE_FRACTION
+    if not 0 < fraction <= 1:
+        raise ValueError("min_cluster_size_fraction must be greater than 0 and at most 1.")
+    return max(2, int(np.ceil(fraction * n_data_points)))
 
 
 def _run_hdbscan_grid(

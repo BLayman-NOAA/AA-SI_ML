@@ -24,6 +24,7 @@ from .ml_algorithms import (
     apply_min_cluster_size_filter,
     assign_noise_by_soft_membership,
     _calculate_silhouette,
+    _resolve_min_cluster_size,
     retrieve_background_cluster,
 )
 from .plotting_and_logging import (
@@ -35,6 +36,8 @@ from .plotting_and_logging import (
 )
 
 logger = logging.getLogger(__name__)
+
+ML_FEATURE_STATS_SOURCE = 'ml_features'
 
 
 
@@ -1491,9 +1494,10 @@ def extract_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_
         normalize_data_name (str or None): Name of normalized data to use
             for statistics. Defaults to None (uses *dataset_name*).
         sv_data_var (str or None): Name of original Sv variable to use
-            for statistics (e.g. ``'Sv'``, ``'Sv_corrected'``). If
-            provided, statistics are calculated from gridded Sv data
-            instead of flattened normalized data. Defaults to None.
+            for statistics (e.g. ``'Sv'``, ``'Sv_corrected'``). Use
+            ``'ml_features'`` to calculate statistics from flattened ML
+            features explicitly. When None, flattened ML features are used
+            for backward compatibility.
         compute_pairwise_diffs (bool): If True and *sv_data_var* is
             provided, compute pairwise differences between channels in
             addition to original channel values. Defaults to False.
@@ -1515,8 +1519,10 @@ def extract_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_
     
     cluster_labels = ds_ml_ready[full_cluster_name].values
     
-    # Determine source data based on whether sv_data_var is provided
-    if sv_data_var is not None:
+    use_ml_features = sv_data_var is None or sv_data_var == ML_FEATURE_STATS_SOURCE
+
+    # Determine source data based on whether ML features or gridded Sv was requested.
+    if not use_ml_features:
         # Use original gridded Sv data
         if sv_data_var not in ds_ml_ready:
             raise ValueError(f"Sv data variable '{sv_data_var}' not found in dataset")
@@ -1578,7 +1584,7 @@ def extract_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_
             data_description = f"Original Sv data: {sv_data_var}"
         
     else:
-        # Use flattened normalized data (original behavior)
+        # Use flattened ML feature data.
         source_data_name = dataset_name
         if normalize_data_name is not None:
             source_data_name = f"{dataset_name}_{normalize_data_name}"
@@ -1593,7 +1599,10 @@ def extract_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_
                             if not dim.endswith('_sample_index')][0]
         feature_coords = ds_ml_ready[source_data_name].coords[feature_dim_name].values
         
-        data_description = f"Source data: {source_data_name}"
+        if sv_data_var == ML_FEATURE_STATS_SOURCE:
+            data_description = f"ML features: {source_data_name}"
+        else:
+            data_description = f"Source data: {source_data_name}"
     
     # Get unique clusters (excluding noise if present)
     unique_clusters = np.unique(cluster_labels)
@@ -1959,24 +1968,30 @@ def _build_overlay_lines(overlay_line_var):
 
 
 def run_hdbscan(
-        ds_normalized,
-        dataset_name,
-        normalization_name,
-        ml_result_name,
-        min_cluster_size,
-        min_samples=2,
-        sample_size=1000000,
-        cluster_selection_method="leaf",
-        use_hdbscan=True,
-        epsilon=0.004,
-        find_background_cluster=False,
-        soft_membership_threshold=None,
-        ):
+    ds_normalized,
+    dataset_name,
+    normalization_name,
+    ml_result_name,
+    min_cluster_size=None,
+    min_cluster_size_fraction=None,
+    min_samples=2,
+    sample_size=1000000,
+    cluster_selection_method="leaf",
+    use_hdbscan=True,
+    epsilon=0.004,
+    find_background_cluster=False,
+    soft_membership_threshold=None,
+    ):
     """Run clustering as a pure-compute step and return result metadata."""
     X, _, sample_indices = extract_valid_samples_for_sklearn(
         ds_normalized,
         normalization_name,
         dataset_name=dataset_name,
+    )
+    min_cluster_size = _resolve_min_cluster_size(
+        min_cluster_size,
+        len(X),
+        min_cluster_size_fraction=min_cluster_size_fraction,
     )
 
     background_label = None
@@ -2087,10 +2102,15 @@ def _plot_single_clustering_result(
         overlay_lines=overlay_lines,
     )
 
+    cluster_stats_normalization_name = None
+    if cluster_stats_sv_data_var == ML_FEATURE_STATS_SOURCE:
+        cluster_stats_normalization_name = clustering_result.get('normalization_name')
+
     plot_cluster_statistics(
         ds_normalized,
         ml_result_name,
         dataset_name=dataset_name,
+        normalize_data_name=cluster_stats_normalization_name,
         cluster_colors=resolved_cluster_colors,
         sv_data_var=cluster_stats_sv_data_var,
         compute_pairwise_diffs=cluster_stats_compute_pairwise_differences,
@@ -2152,7 +2172,12 @@ def plot_clustering_report(
         cluster_stats_sv_data_var="Sv",
         cluster_stats_compute_pairwise_differences=True,
         ):
-    """Render the full clustering report for one or more clustering results."""
+    """Render the full clustering report for one or more clustering results.
+
+    Set ``cluster_stats_sv_data_var='ml_features'`` to plot statistics for
+    the flattened ML features used by clustering instead of gridded Sv channel
+    values.
+    """
     if isinstance(clustering_results, list):
         for index, clustering_result in enumerate(clustering_results, start=1):
             result_name = clustering_result.get('ml_result_name') or f"{ml_result_name}_{index}"
@@ -2187,7 +2212,7 @@ def plot_clustering_report(
     )
 
 
-
+# NOTE: Not used in recipe manager
 def extract_data_and_run_hdbscan(
         ds_normalized,
         custom_dataset_name, 
@@ -2198,7 +2223,8 @@ def extract_data_and_run_hdbscan(
         epsilon=0.004,
         min_samples=2,
         sample_size=1000000,
-        min_cluster_size=2000,
+        min_cluster_size=None,
+        min_cluster_size_fraction=None,
         cluster_selection_method="leaf",
         use_hdbscan=True,
         find_background_cluster=False,
@@ -2229,8 +2255,11 @@ def extract_data_and_run_hdbscan(
         min_samples (int): Core-point neighbourhood size.
             Defaults to 2.
         sample_size (int): Sub-sample size. Defaults to 1_000_000.
-        min_cluster_size (int): Minimum cluster size.
-            Defaults to 2000.
+        min_cluster_size (int or None): Absolute minimum cluster size.
+            Mutually exclusive with min_cluster_size_fraction. Defaults to None.
+        min_cluster_size_fraction (float or None): Fraction of data points
+            used to derive min_cluster_size when an absolute size is not
+            provided. When None, defaults to 0.03. Defaults to None.
         cluster_selection_method (str): HDBSCAN cluster-selection
             method. Defaults to 'leaf'.
         use_hdbscan (bool): Use HDBSCAN instead of DBSCAN.
@@ -2262,6 +2291,7 @@ def extract_data_and_run_hdbscan(
         normalization_name=custom_normalization_name,
         ml_result_name=ml_result_name,
         min_cluster_size=min_cluster_size,
+        min_cluster_size_fraction=min_cluster_size_fraction,
         min_samples=min_samples,
         sample_size=sample_size,
         cluster_selection_method=cluster_selection_method,
@@ -2306,7 +2336,7 @@ def extract_data_and_run_hdbscan(
     )
 
 
-
+# NOTE: Not use in recipe manager
 def full_dbscan_iteration(
         ds_Sv,
         custom_dataset_name, 
@@ -2322,7 +2352,8 @@ def full_dbscan_iteration(
         epsilon=0.004,
         min_samples=2,
         sample_size=1000000,
-        min_cluster_size=2000,
+        min_cluster_size=None,
+        min_cluster_size_fraction=None,
         cluster_selection_method="leaf",
         use_hdbscan=True,
         exclude_cluster_data_name=None,
@@ -2368,8 +2399,11 @@ def full_dbscan_iteration(
         min_samples (int): Core-point neighbourhood size.
             Defaults to 2.
         sample_size (int): Sub-sample size. Defaults to 1_000_000.
-        min_cluster_size (int): Minimum cluster size.
-            Defaults to 2000.
+        min_cluster_size (int or None): Absolute minimum cluster size.
+            Mutually exclusive with min_cluster_size_fraction. Defaults to None.
+        min_cluster_size_fraction (float or None): Fraction of data points
+            used to derive min_cluster_size when an absolute size is not
+            provided. When None, defaults to 0.03. Defaults to None.
         cluster_selection_method (str): HDBSCAN method.
             Defaults to 'leaf'.
         use_hdbscan (bool): Use HDBSCAN. Defaults to True.
@@ -2473,6 +2507,7 @@ def full_dbscan_iteration(
         min_samples=min_samples,
         sample_size=sample_size,
         min_cluster_size=min_cluster_size,
+        min_cluster_size_fraction=min_cluster_size_fraction,
         cluster_selection_method=cluster_selection_method,
         use_hdbscan=use_hdbscan,
         find_background_cluster=find_background_cluster,

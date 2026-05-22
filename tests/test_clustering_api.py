@@ -65,6 +65,113 @@ def test_run_hdbscan_returns_single_clustering_result(monkeypatch):
     np.testing.assert_array_equal(output['clustering_results']['labels'], np.array([0, 1]))
 
 
+def test_run_hdbscan_defaults_min_cluster_size_to_three_percent(monkeypatch):
+    ds_normalized = _make_ds_normalized()
+    captured = {}
+
+    monkeypatch.setattr(
+        ml,
+        'extract_valid_samples_for_sklearn',
+        lambda *_args, **_kwargs: (
+            np.zeros((101, 2), dtype=float),
+            np.arange(101),
+            np.arange(101),
+        ),
+    )
+
+    def _capture_clustering(*_args, **kwargs):
+        captured['min_cluster_size'] = kwargs['min_cluster_size']
+        return {
+            'run_1': {
+                'labels': np.zeros(101, dtype=int),
+                'sample_indices': np.arange(101),
+                'model': 'model',
+                'method': 'hdbscan',
+                'min_cluster_size': kwargs['min_cluster_size'],
+            }
+        }
+
+    monkeypatch.setattr(ml, 'apply_dbscan_clustering', _capture_clustering)
+
+    output = ml.run_hdbscan(
+        ds_normalized,
+        dataset_name='ml_data_clean',
+        normalization_name='normalized_data',
+        ml_result_name='clusters',
+    )
+
+    assert captured['min_cluster_size'] == 4
+    assert output['clustering_results']['min_cluster_size'] == 4
+
+
+def test_run_hdbscan_accepts_min_cluster_size_fraction(monkeypatch):
+    ds_normalized = _make_ds_normalized()
+    captured = {}
+
+    monkeypatch.setattr(
+        ml,
+        'extract_valid_samples_for_sklearn',
+        lambda *_args, **_kwargs: (
+            np.zeros((101, 2), dtype=float),
+            np.arange(101),
+            np.arange(101),
+        ),
+    )
+
+    def _capture_clustering(*_args, **kwargs):
+        captured['min_cluster_size'] = kwargs['min_cluster_size']
+        return {
+            'run_1': {
+                'labels': np.zeros(101, dtype=int),
+                'sample_indices': np.arange(101),
+                'model': 'model',
+                'method': 'hdbscan',
+                'min_cluster_size': kwargs['min_cluster_size'],
+            }
+        }
+
+    monkeypatch.setattr(ml, 'apply_dbscan_clustering', _capture_clustering)
+
+    output = ml.run_hdbscan(
+        ds_normalized,
+        dataset_name='ml_data_clean',
+        normalization_name='normalized_data',
+        ml_result_name='clusters',
+        min_cluster_size_fraction=0.07,
+    )
+
+    assert captured['min_cluster_size'] == 8
+    assert output['clustering_results']['min_cluster_size'] == 8
+
+
+def test_run_hdbscan_rejects_min_cluster_size_and_fraction(monkeypatch):
+    ds_normalized = _make_ds_normalized()
+
+    monkeypatch.setattr(
+        ml,
+        'extract_valid_samples_for_sklearn',
+        lambda *_args, **_kwargs: (
+            np.zeros((101, 2), dtype=float),
+            np.arange(101),
+            np.arange(101),
+        ),
+    )
+
+    try:
+        ml.run_hdbscan(
+            ds_normalized,
+            dataset_name='ml_data_clean',
+            normalization_name='normalized_data',
+            ml_result_name='clusters',
+            min_cluster_size=5,
+            min_cluster_size_fraction=0.07,
+        )
+    except ValueError as exc:
+        assert "min_cluster_size or min_cluster_size_fraction" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError")
+
+
 def test_run_hdbscan_returns_background_label_when_requested(monkeypatch):
     ds_normalized = _make_ds_normalized()
 
@@ -182,6 +289,42 @@ def test_plot_clustering_report_renders_full_report(monkeypatch):
     )
 
     assert plotted == {'echogram': 1, 'stats': 1, 'hierarchy': 1}
+
+
+def test_plot_clustering_report_supports_explicit_ml_feature_stats_source(monkeypatch):
+    ds_normalized = _make_ds_normalized()
+    captured = {}
+
+    monkeypatch.setattr(ml.echogram, 'plot_cluster_echogram', lambda *args, **kwargs: None)
+    monkeypatch.setattr(ml, 'plot_dbscan_cluster_hierarchy', lambda *args, **kwargs: None)
+
+    def _capture_stats(*args, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(ml, 'plot_cluster_statistics', _capture_stats)
+
+    clustering_result = {
+        'labels': np.array([0, 1]),
+        'sample_indices': np.array([0, 1]),
+        'model': None,
+        'method': 'hdbscan',
+        'plot_hierarchy': False,
+        'ml_result_name': 'clusters',
+        'normalization_name': 'normalized_data',
+    }
+
+    ml.plot_clustering_report(
+        ds_normalized,
+        clustering_result,
+        dataset_name='ml_data_clean',
+        ml_result_name='clusters',
+        cluster_stats_sv_data_var='ml_features',
+        cluster_stats_compute_pairwise_differences=False,
+    )
+
+    assert captured['sv_data_var'] == 'ml_features'
+    assert captured['normalize_data_name'] == 'normalized_data'
+    assert captured['compute_pairwise_diffs'] is False
 
 
 def test_embed_clustering_results_supports_list_input(monkeypatch):

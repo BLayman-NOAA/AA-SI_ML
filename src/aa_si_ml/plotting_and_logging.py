@@ -193,7 +193,7 @@ def print_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_da
 
 def plot_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_data_clean',
                            normalize_data_name=None, sv_data_var=None,
-                           stat_type='mean', include_noise=False, 
+                           stat_type='mean', include_noise=True,
                            cluster_colors=None, figsize=(12, 6),
                            title=None, save_path=None, compute_pairwise_diffs=False):
     """Plot cluster statistics as bar charts with error bars.
@@ -209,12 +209,13 @@ def plot_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_dat
             Defaults to 'ml_data_clean'.
         normalize_data_name (str or None): Name of normalized data.
             Defaults to None.
-        sv_data_var (str or None): Name of original Sv variable.
+        sv_data_var (str or None): Name of original Sv variable, or
+            ``'ml_features'`` to plot flattened ML features explicitly.
             Defaults to None.
         stat_type (str): Statistic to plot: ``'mean'``, ``'min'``, or
             ``'max'``. Defaults to 'mean'.
         include_noise (bool): Include noise cluster in the plot.
-            Defaults to False.
+            Defaults to True. Noise bars are rendered in white.
         cluster_colors (list[str] or None): Hex colour strings.
             Defaults to None (uses built-in palette).
         figsize (tuple): Figure size. Defaults to (12, 6).
@@ -277,31 +278,37 @@ def plot_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_dat
         cluster_color_list = []
         for cluster_id in cluster_ids:
             if cluster_id == -1:
-                cluster_color_list.append('gray')
+                cluster_color_list.append('white')
             elif cluster_id < len(cluster_colors):
                 cluster_color_list.append(cluster_colors[cluster_id])
             else:
                 cluster_color_list.append('gray')
                 print(f"Warning: No color provided for cluster {cluster_id}, using gray")
 
-    # Classify features as Sv or difference
+    plot_ml_features = sv_data_var == 'ml_features' or data_description.startswith('ML features:')
+
+    # Classify features as Sv, differences, or explicit ML features.
+    ml_feature_indices = []
     sv_feature_indices = []
     diff_feature_indices = []
-    
-    for j, feature_name in enumerate(feature_coords):
-        feature_name_lower = str(feature_name).lower()
-        is_sv_feature = (
-            'sv' in feature_name_lower and 'diff' not in feature_name_lower
-        ) or (np.mean(stat_values[:, j]) < -40 and np.mean(stat_values[:, j]) > -100)
-        is_sv_diff = (
-            'diff' in feature_name_lower or
-            (np.min(stat_values[:, j]) > -50 and np.max(stat_values[:, j]) < 50)
-        )
-        
-        if is_sv_feature:
-            sv_feature_indices.append(j)
-        elif is_sv_diff:
-            diff_feature_indices.append(j)
+
+    if plot_ml_features:
+        ml_feature_indices = list(range(n_features))
+    else:
+        for j, feature_name in enumerate(feature_coords):
+            feature_name_lower = str(feature_name).lower()
+            is_sv_feature = (
+                'sv' in feature_name_lower and 'diff' not in feature_name_lower
+            ) or (np.mean(stat_values[:, j]) < -40 and np.mean(stat_values[:, j]) > -100)
+            is_sv_diff = (
+                'diff' in feature_name_lower or
+                (np.min(stat_values[:, j]) > -50 and np.max(stat_values[:, j]) < 50)
+            )
+            
+            if is_sv_feature:
+                sv_feature_indices.append(j)
+            elif is_sv_diff:
+                diff_feature_indices.append(j)
 
     baseline_axes_y = 0.5
     
@@ -343,6 +350,25 @@ def plot_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_dat
         diff_y_min_aligned = None
         diff_y_max_aligned = None
 
+    if ml_feature_indices:
+        ml_baseline = 0
+        ml_values = stat_values[:, ml_feature_indices]
+        ml_stds = stds[:, ml_feature_indices]
+        ml_y_min = np.min(ml_values - ml_stds)
+        ml_y_max = np.max(ml_values + ml_stds)
+        ml_y_min = min(ml_y_min, ml_baseline)
+        ml_y_max = max(ml_y_max, ml_baseline)
+
+        below = ml_baseline - ml_y_min
+        above = ml_y_max - ml_baseline
+        total_range = max(below / baseline_axes_y, above / (1 - baseline_axes_y))
+        ml_y_min_aligned = ml_baseline - baseline_axes_y * total_range
+        ml_y_max_aligned = ml_baseline + (1 - baseline_axes_y) * total_range
+    else:
+        ml_baseline = None
+        ml_y_min_aligned = None
+        ml_y_max_aligned = None
+
     fig, ax = plt.subplots(figsize=figsize)
     x = np.arange(n_clusters)
     width = 0.8 / n_features
@@ -350,6 +376,11 @@ def plot_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_dat
     axes = []
     ax_sv = None
     ax_diff = None
+    ax_ml = None
+
+    if ml_feature_indices:
+        ax_ml = ax
+        axes.append(('ml_features', ax_ml, ml_feature_indices))
     
     if sv_feature_indices:
         ax_sv = ax
@@ -363,7 +394,11 @@ def plot_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_dat
         axes.append(('diff', ax_diff, diff_feature_indices))
 
     for group_type, ax_feature, feature_indices in axes:
-        if group_type == 'sv':
+        if group_type == 'ml_features':
+            baseline = ml_baseline
+            y_min, y_max = ml_y_min_aligned, ml_y_max_aligned
+            ylabel = 'ML Feature Value'
+        elif group_type == 'sv':
             baseline = sv_baseline
             y_min, y_max = sv_y_min_aligned, sv_y_max_aligned
             ylabel = 'Sv (dB)'
@@ -404,7 +439,9 @@ def plot_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_dat
             zorder=0
         )
         
-        if group_type == 'sv':
+        if group_type == 'ml_features':
+            ax_feature.grid(True, alpha=0.3, linestyle='--', axis='y')
+        elif group_type == 'sv':
             ax_feature.axhline(y=-80, color='black', linestyle=':', linewidth=2, alpha=0.7, zorder=1)
             if ax_sv == ax:
                 ax_feature.grid(True, alpha=0.3, linestyle='--', axis='y')
@@ -446,7 +483,8 @@ def plot_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_dat
     else:
         plt.show()
     
-    return fig, [ax_sv, ax_diff] if ax_diff else [ax_sv], stats_dict
+    axes_list = [axis for _, axis, _ in axes]
+    return fig, axes_list, stats_dict
 
 
 def plot_dbscan_cluster_hierarchy(model, cluster_colors_by_index=None):
