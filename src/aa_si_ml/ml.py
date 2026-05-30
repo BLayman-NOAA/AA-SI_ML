@@ -40,6 +40,48 @@ logger = logging.getLogger(__name__)
 ML_FEATURE_STATS_SOURCE = 'ml_features'
 
 
+def _json_scalar(value):
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return repr(value)
+
+
+def _clustering_result_to_dataset(clustering_result):
+    """Represent a clustering result as an xarray Dataset for Zarr checkpoints."""
+    labels = np.asarray(clustering_result['labels'])
+    sample_indices = np.asarray(clustering_result['sample_indices'])
+    sample_dim = 'cluster_sample'
+    attrs = {
+        key: _json_scalar(value)
+        for key, value in clustering_result.items()
+        if key not in {'labels', 'sample_indices', 'model'}
+    }
+    model = clustering_result.get('model')
+    if model is not None:
+        attrs['model_type'] = f"{model.__class__.__module__}.{model.__class__.__name__}"
+        attrs['model_available'] = False
+    return xr.Dataset(
+        data_vars={
+            'labels': (sample_dim, labels),
+            'sample_indices': (sample_dim, sample_indices),
+        },
+        coords={sample_dim: np.arange(labels.size, dtype=np.int64)},
+        attrs=attrs,
+    )
+
+
+def _coerce_clustering_result(clustering_result):
+    if isinstance(clustering_result, xr.Dataset):
+        result = dict(clustering_result.attrs)
+        result['labels'] = clustering_result['labels'].values
+        result['sample_indices'] = clustering_result['sample_indices'].values
+        result['model'] = None
+        return result
+    return clustering_result
+
+
 
 def add_cluster_mask(ds_Sv, cluster_labels_gridded, cluster_label=None,
                      use_corrected=True, mask_name='cluster_mask'):
@@ -2033,7 +2075,8 @@ def run_hdbscan(
     )
 
     return {
-        'clustering_results': clustering_result,
+        'clustering_results': _clustering_result_to_dataset(clustering_result),
+        'clustering_model': clustering_result.get('model'),
         'dbscan_results': dbscan_results,
         'background_label': background_label,
     }
@@ -2075,6 +2118,7 @@ def _plot_single_clustering_result(
         clustering_result,
         dataset_name,
         ml_result_name,
+        clustering_model=None,
         ds_Sv=None,
         plot_window=None,
         overlay_line_var=None,
@@ -2082,6 +2126,11 @@ def _plot_single_clustering_result(
         y_to_x_aspect_ratio_override=None,
         cluster_stats_sv_data_var="Sv",
         cluster_stats_compute_pairwise_differences=True,
+        save_image=None,
+        save_formats=None,
+        save_dir=None,
+        show=None,
+        dpi=None,
         ):
     resolved_plot_window = _resolve_plot_window(plot_window)
     resolved_cluster_colors = cluster_colors or DEFAULT_CLUSTER_COLORS
@@ -2100,6 +2149,11 @@ def _plot_single_clustering_result(
         y_to_x_aspect_ratio_override=y_to_x_aspect_ratio_override,
         cluster_colors=resolved_cluster_colors,
         overlay_lines=overlay_lines,
+        save_image=save_image,
+        save_formats=save_formats,
+        save_dir=save_dir,
+        show=show,
+        dpi=dpi,
     )
 
     cluster_stats_normalization_name = None
@@ -2114,12 +2168,23 @@ def _plot_single_clustering_result(
         cluster_colors=resolved_cluster_colors,
         sv_data_var=cluster_stats_sv_data_var,
         compute_pairwise_diffs=cluster_stats_compute_pairwise_differences,
+        save_image=save_image,
+        save_formats=save_formats,
+        save_dir=save_dir,
+        show=show,
+        dpi=dpi,
     )
 
-    if clustering_result.get('plot_hierarchy') and clustering_result.get('model') is not None:
+    hierarchy_model = clustering_model or clustering_result.get('model')
+    if clustering_result.get('plot_hierarchy') and hierarchy_model is not None:
         plot_dbscan_cluster_hierarchy(
-            clustering_result['model'],
+            hierarchy_model,
             cluster_colors_by_index=resolved_cluster_colors,
+            save_image=save_image,
+            save_formats=save_formats,
+            save_dir=save_dir,
+            show=show,
+            dpi=dpi,
         )
 
 
@@ -2135,6 +2200,7 @@ def embed_clustering_results(
         gridded_results = {}
 
         for index, clustering_result in enumerate(clustering_results, start=1):
+            clustering_result = _coerce_clustering_result(clustering_result)
             result_name = clustering_result.get('ml_result_name') or f"{ml_result_name}_{index}"
             embedded = _embed_single_clustering_result(
                 ds_final,
@@ -2150,6 +2216,7 @@ def embed_clustering_results(
             'gridded_results': gridded_results,
         }
 
+    clustering_results = _coerce_clustering_result(clustering_results)
     result_name = clustering_results.get('ml_result_name', ml_result_name)
     return _embed_single_clustering_result(
         ds_normalized,
@@ -2164,6 +2231,7 @@ def plot_clustering_report(
         clustering_results,
         dataset_name,
         ml_result_name,
+        clustering_model=None,
         ds_Sv=None,
         plot_window=None,
         overlay_line_var=None,
@@ -2171,6 +2239,11 @@ def plot_clustering_report(
         y_to_x_aspect_ratio_override=None,
         cluster_stats_sv_data_var="Sv",
         cluster_stats_compute_pairwise_differences=True,
+        save_image=None,
+        save_formats=None,
+        save_dir=None,
+        show=None,
+        dpi=None,
         ):
     """Render the full clustering report for one or more clustering results.
 
@@ -2180,12 +2253,14 @@ def plot_clustering_report(
     """
     if isinstance(clustering_results, list):
         for index, clustering_result in enumerate(clustering_results, start=1):
+            clustering_result = _coerce_clustering_result(clustering_result)
             result_name = clustering_result.get('ml_result_name') or f"{ml_result_name}_{index}"
             _plot_single_clustering_result(
                 ds_normalized,
                 clustering_result,
                 dataset_name=dataset_name,
                 ml_result_name=result_name,
+                clustering_model=clustering_model,
                 ds_Sv=ds_Sv,
                 plot_window=plot_window,
                 overlay_line_var=overlay_line_var,
@@ -2193,15 +2268,22 @@ def plot_clustering_report(
                 y_to_x_aspect_ratio_override=y_to_x_aspect_ratio_override,
                 cluster_stats_sv_data_var=cluster_stats_sv_data_var,
                 cluster_stats_compute_pairwise_differences=cluster_stats_compute_pairwise_differences,
+                save_image=save_image,
+                save_formats=save_formats,
+                save_dir=save_dir,
+                show=show,
+                dpi=dpi,
             )
         return
 
+    clustering_results = _coerce_clustering_result(clustering_results)
     result_name = clustering_results.get('ml_result_name', ml_result_name)
     _plot_single_clustering_result(
         ds_normalized,
         clustering_results,
         dataset_name=dataset_name,
         ml_result_name=result_name,
+        clustering_model=clustering_model,
         ds_Sv=ds_Sv,
         plot_window=plot_window,
         overlay_line_var=overlay_line_var,
@@ -2209,6 +2291,11 @@ def plot_clustering_report(
         y_to_x_aspect_ratio_override=y_to_x_aspect_ratio_override,
         cluster_stats_sv_data_var=cluster_stats_sv_data_var,
         cluster_stats_compute_pairwise_differences=cluster_stats_compute_pairwise_differences,
+        save_image=save_image,
+        save_formats=save_formats,
+        save_dir=save_dir,
+        show=show,
+        dpi=dpi,
     )
 
 

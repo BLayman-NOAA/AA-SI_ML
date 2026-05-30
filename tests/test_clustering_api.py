@@ -61,8 +61,13 @@ def test_run_hdbscan_returns_single_clustering_result(monkeypatch):
     )
 
     assert output['background_label'] is None
-    assert output['clustering_results']['ml_result_name'] == 'clusters'
-    np.testing.assert_array_equal(output['clustering_results']['labels'], np.array([0, 1]))
+    assert isinstance(output['clustering_results'], xr.Dataset)
+    assert output['clustering_results'].attrs['ml_result_name'] == 'clusters'
+    assert output['clustering_results'].attrs['model_type'] == 'builtins.str'
+    assert output['clustering_results'].attrs['model_available'] is False
+    assert output['clustering_results'].attrs['plot_hierarchy'] is True
+    assert output['clustering_model'] == 'model'
+    np.testing.assert_array_equal(output['clustering_results']['labels'].values, np.array([0, 1]))
 
 
 def test_run_hdbscan_defaults_min_cluster_size_to_three_percent(monkeypatch):
@@ -101,7 +106,7 @@ def test_run_hdbscan_defaults_min_cluster_size_to_three_percent(monkeypatch):
     )
 
     assert captured['min_cluster_size'] == 4
-    assert output['clustering_results']['min_cluster_size'] == 4
+    assert output['clustering_results'].attrs['min_cluster_size'] == 4
 
 
 def test_run_hdbscan_accepts_min_cluster_size_fraction(monkeypatch):
@@ -141,7 +146,7 @@ def test_run_hdbscan_accepts_min_cluster_size_fraction(monkeypatch):
     )
 
     assert captured['min_cluster_size'] == 8
-    assert output['clustering_results']['min_cluster_size'] == 8
+    assert output['clustering_results'].attrs['min_cluster_size'] == 8
 
 
 def test_run_hdbscan_rejects_min_cluster_size_and_fraction(monkeypatch):
@@ -210,7 +215,7 @@ def test_run_hdbscan_returns_background_label_when_requested(monkeypatch):
     )
 
     assert output['background_label'] == 0
-    assert output['clustering_results']['plot_hierarchy'] is False
+    assert output['clustering_results'].attrs['plot_hierarchy'] is False
 
 
 def test_embed_clustering_results_returns_dataset_and_grid(monkeypatch):
@@ -250,6 +255,51 @@ def test_embed_clustering_results_returns_dataset_and_grid(monkeypatch):
 
     assert 'ml_data_clean_clusters' in output['ds_normalized']
     assert output['gridded_results'].dims == ('ping_time', 'range_sample')
+
+
+def test_embed_clustering_results_accepts_xarray_dataset(monkeypatch):
+    ds_normalized = _make_ds_normalized()
+
+    def _store(ds_in, flat_results, specific_data_name, dataset_name='ml_data_clean', result_sample_indices=None):
+        ds_out = ds_in.copy()
+        ds_out[f'{dataset_name}_{specific_data_name}'] = xr.DataArray(
+            flat_results,
+            dims=[f'{dataset_name}_sample_index'],
+            coords={f'{dataset_name}_sample_index': result_sample_indices},
+        )
+        return ds_out
+
+    monkeypatch.setattr(ml, 'store_ml_results_flattened', _store)
+    monkeypatch.setattr(
+        ml,
+        'extract_ml_data_gridded',
+        lambda *_args, **_kwargs: xr.DataArray(np.array([[1.0, np.nan]]), dims=['ping_time', 'range_sample']),
+    )
+
+    clustering_result = ml._clustering_result_to_dataset(
+        {
+            'labels': np.array([0, 1]),
+            'sample_indices': np.array([0, 1]),
+            'model': 'model',
+            'method': 'hdbscan',
+            'plot_hierarchy': True,
+            'ml_result_name': 'clusters',
+        }
+    )
+
+    output = ml.embed_clustering_results(
+        ds_normalized,
+        clustering_result,
+        dataset_name='ml_data_clean',
+        ml_result_name='clusters',
+    )
+
+    assert 'ml_data_clean_clusters' in output['ds_normalized']
+    np.testing.assert_array_equal(
+        output['ds_normalized']['ml_data_clean_clusters'].values[:2],
+        np.array([0.0, 1.0]),
+    )
+    assert np.isnan(output['ds_normalized']['ml_data_clean_clusters'].values[2])
 
 
 def test_plot_clustering_report_renders_full_report(monkeypatch):
@@ -325,6 +375,40 @@ def test_plot_clustering_report_supports_explicit_ml_feature_stats_source(monkey
     assert captured['sv_data_var'] == 'ml_features'
     assert captured['normalize_data_name'] == 'normalized_data'
     assert captured['compute_pairwise_diffs'] is False
+
+
+def test_plot_clustering_report_uses_separate_model_for_dataset_results(monkeypatch):
+    ds_normalized = _make_ds_normalized()
+    plotted = {'hierarchy_model': None}
+
+    monkeypatch.setattr(ml.echogram, 'plot_cluster_echogram', lambda *args, **kwargs: None)
+    monkeypatch.setattr(ml, 'plot_cluster_statistics', lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        ml,
+        'plot_dbscan_cluster_hierarchy',
+        lambda model, **kwargs: plotted.__setitem__('hierarchy_model', model),
+    )
+
+    clustering_result = ml._clustering_result_to_dataset(
+        {
+            'labels': np.array([0, 1]),
+            'sample_indices': np.array([0, 1]),
+            'model': 'model',
+            'method': 'hdbscan',
+            'plot_hierarchy': True,
+            'ml_result_name': 'clusters',
+        }
+    )
+
+    ml.plot_clustering_report(
+        ds_normalized,
+        clustering_result,
+        dataset_name='ml_data_clean',
+        ml_result_name='clusters',
+        clustering_model='model',
+    )
+
+    assert plotted['hierarchy_model'] == 'model'
 
 
 def test_embed_clustering_results_supports_list_input(monkeypatch):

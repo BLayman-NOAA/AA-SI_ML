@@ -1,6 +1,12 @@
 import logging
 
 import numpy as np
+from aa_si_visualization._artifact_output import (
+    configure_matplotlib_backend,
+    render_figure,
+)
+
+configure_matplotlib_backend()
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
@@ -69,7 +75,11 @@ def visualize_normalized_data_histogram(X_normalized, feature_names=None, n_bins
     y_min, y_max = plt.ylim()
     plt.ylim(y_min, y_max * 1.1)
     plt.tight_layout()
-    plt.show()
+    render_figure(
+        plt.gcf(),
+        default_stem='normalized_histogram',
+        artifact_suffix='histogram',
+    )
 
 
 def print_basic_cluster_stats(cluster_labels, n_clusters, n_noise, sil_score, calculate_silhouette):
@@ -195,7 +205,9 @@ def plot_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_dat
                            normalize_data_name=None, sv_data_var=None,
                            stat_type='mean', include_noise=True,
                            cluster_colors=None, figsize=(12, 6),
-                           title=None, save_path=None, compute_pairwise_diffs=False):
+                           title=None, save_path=None, compute_pairwise_diffs=False,
+                           save_image=None, save_formats=None, save_dir=None,
+                           show=None, dpi=None):
     """Plot cluster statistics as bar charts with error bars.
 
     Features are grouped by type (Sv vs differences) with shared y-axes.
@@ -478,16 +490,28 @@ def plot_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_dat
     plt.subplots_adjust(bottom=bottom_margin, right=0.88)
     
     if save_path is not None:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        fig.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"Figure saved to: {save_path}")
+        plt.close(fig)
     else:
-        plt.show()
+        render_figure(
+            fig,
+            default_stem='cluster_statistics',
+            artifact_suffix='cluster_statistics',
+            save_image=save_image,
+            save_formats=save_formats,
+            save_dir=save_dir,
+            show=show,
+            dpi=dpi,
+        )
     
     axes_list = [axis for _, axis, _ in axes]
     return fig, axes_list, stats_dict
 
 
-def plot_dbscan_cluster_hierarchy(model, cluster_colors_by_index=None):
+def plot_dbscan_cluster_hierarchy(model, cluster_colors_by_index=None,
+                                  save_image=None, save_formats=None,
+                                  save_dir=None, show=None, dpi=None):
     """Plot HDBSCAN condensed tree with colours matching cluster labels.
 
     Args:
@@ -542,6 +566,15 @@ def plot_dbscan_cluster_hierarchy(model, cluster_colors_by_index=None):
             if isinstance(getattr(patch, '_center', None), _np.ndarray):
                 patch._center = tuple(float(c) for c in patch._center)
     plt.title('HDBSCAN Condensed Tree')
-    plt.show()
+    render_figure(
+        ax.figure,
+        default_stem='clustering_report',
+        artifact_suffix='hierarchy',
+        save_image=save_image,
+        save_formats=save_formats,
+        save_dir=save_dir,
+        show=show,
+        dpi=dpi,
+    )
     
     return label_to_tree, palette_by_tree_order
