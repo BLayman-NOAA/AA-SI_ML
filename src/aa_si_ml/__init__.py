@@ -16,9 +16,7 @@ except PackageNotFoundError:
     __version__ = "0.0.0.dev"
 
 from .ml import (
-    add_cluster_label_mask,
     add_cluster_mask,
-    add_largest_cluster_mask,
     add_valid_data_mask,
     create_ml_index_coordinate,
     data_preprocessing_pipeline,
@@ -28,8 +26,10 @@ from .ml import (
     extract_ml_data_gridded,
     extract_valid_samples_for_sklearn,
     embed_clustering_results,
+    filter_normalized_by_cluster,
     full_dbscan_iteration,
     get_grid_coordinates,
+    merge_clustering_passes,
     normalize_data,
     remove_noise,
     reshape_and_normalize_data,
@@ -57,9 +57,7 @@ from .plotting_and_logging import (
 
 __all__ = [
     "__version__",
-    "add_cluster_label_mask",
     "add_cluster_mask",
-    "add_largest_cluster_mask",
     "add_valid_data_mask",
     "apply_dbscan_clustering",
     "apply_kmeans_clustering",
@@ -73,8 +71,10 @@ __all__ = [
     "extract_ml_data_gridded",
     "extract_valid_samples_for_sklearn",
     "embed_clustering_results",
+    "filter_normalized_by_cluster",
     "full_dbscan_iteration",
     "get_grid_coordinates",
+    "merge_clustering_passes",
     "normalize_data",
     "plot_cluster_statistics",
     "plot_dbscan_cluster_hierarchy",

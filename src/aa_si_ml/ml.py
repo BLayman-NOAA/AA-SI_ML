@@ -49,24 +49,35 @@ def _json_scalar(value):
 
 
 def _clustering_result_to_dataset(clustering_result):
-    """Represent a clustering result as an xarray Dataset for Zarr checkpoints."""
+    """Represent a clustering result as an xarray Dataset for Zarr checkpoints.
+
+    If *clustering_result* contains a ``'parent_labels'`` key, that array is
+    stored as an additional ``parent_labels`` variable on the same
+    ``cluster_sample`` dimension, enabling parent→child lineage queries after
+    :func:`merge_clustering_passes`.
+    """
     labels = np.asarray(clustering_result['labels'])
     sample_indices = np.asarray(clustering_result['sample_indices'])
     sample_dim = 'cluster_sample'
+    _excluded = {'labels', 'sample_indices', 'model', 'parent_labels'}
     attrs = {
         key: _json_scalar(value)
         for key, value in clustering_result.items()
-        if key not in {'labels', 'sample_indices', 'model'}
+        if key not in _excluded
     }
     model = clustering_result.get('model')
     if model is not None:
         attrs['model_type'] = f"{model.__class__.__module__}.{model.__class__.__name__}"
         attrs['model_available'] = False
+    data_vars = {
+        'labels': (sample_dim, labels),
+        'sample_indices': (sample_dim, sample_indices),
+    }
+    parent_labels = clustering_result.get('parent_labels')
+    if parent_labels is not None:
+        data_vars['parent_labels'] = (sample_dim, np.asarray(parent_labels))
     return xr.Dataset(
-        data_vars={
-            'labels': (sample_dim, labels),
-            'sample_indices': (sample_dim, sample_indices),
-        },
+        data_vars=data_vars,
         coords={sample_dim: np.arange(labels.size, dtype=np.int64)},
         attrs=attrs,
     )
@@ -78,6 +89,8 @@ def _coerce_clustering_result(clustering_result):
         result['labels'] = clustering_result['labels'].values
         result['sample_indices'] = clustering_result['sample_indices'].values
         result['model'] = None
+        if 'parent_labels' in clustering_result:
+            result['parent_labels'] = clustering_result['parent_labels'].values
         return result
     return clustering_result
 
@@ -133,43 +146,6 @@ def add_cluster_mask(ds_Sv, cluster_labels_gridded, cluster_label=None,
     ds_Sv[mask_name].attrs['source_variable'] = cluster_labels_gridded
 
     return ds_Sv
-
-
-def add_largest_cluster_mask(ds_Sv, cluster_labels_gridded, use_corrected=True,
-                             mask_name='largest_cluster_mask'):
-    """Create a mask excluding the largest cluster. Wraps add_cluster_mask.
-
-    Args:
-        ds_Sv (xr.Dataset): Dataset containing Sv data.
-        cluster_labels_gridded (xr.DataArray): 2-D gridded cluster labels.
-        use_corrected (bool): Use Sv_corrected when available. Defaults to True.
-        mask_name (str): Name for the stored mask variable.
-            Defaults to 'largest_cluster_mask'.
-
-    Returns:
-        xr.Dataset: Input dataset with the mask added.
-    """
-    return add_cluster_mask(ds_Sv, cluster_labels_gridded, cluster_label=None,
-                            use_corrected=use_corrected, mask_name=mask_name)
-
-
-def add_cluster_label_mask(ds_Sv, cluster_labels_gridded, cluster_label,
-                           use_corrected=True, mask_name='cluster_mask'):
-    """Create a mask excluding a specific cluster label. Wraps add_cluster_mask.
-
-    Args:
-        ds_Sv (xr.Dataset): Dataset containing Sv data.
-        cluster_labels_gridded (xr.DataArray): 2-D gridded cluster labels.
-        cluster_label (int): The specific cluster label to mask out.
-        use_corrected (bool): Use Sv_corrected when available. Defaults to True.
-        mask_name (str): Name for the stored mask variable.
-            Defaults to 'cluster_mask'.
-
-    Returns:
-        xr.Dataset: Dataset with the mask added.
-    """
-    return add_cluster_mask(ds_Sv, cluster_labels_gridded, cluster_label=cluster_label,
-                            use_corrected=use_corrected, mask_name=mask_name)
 
 
 def get_grid_coordinates(ds_Sv, data_var):
@@ -1330,7 +1306,9 @@ def extract_valid_samples_for_sklearn(ds_ml_ready, specific_data_name=None, data
         # Get grid_indices using universal mapping
         mapping_name = f'{dataset_name}_sample_index_to_grid_index'
         result_sample_indices = data.coords[sample_index_coord_name].values
-        grid_indices = ds_ml_ready[mapping_name][result_sample_indices].values
+        grid_indices = ds_ml_ready[mapping_name].sel(
+            {sample_index_coord_name: result_sample_indices}
+        ).values
         logger.debug("Using flattened data '%s': %d samples with %d features.", full_data_var, X.shape[0], X.shape[1])
         return X, grid_indices, result_sample_indices
     else:
@@ -1457,7 +1435,9 @@ def extract_ml_data_gridded(ds_ml_ready, specific_data_name="", dataset_name='ml
     flat_results = ds_ml_ready[full_result_name]
     result_sample_indices = flat_results.coords[sample_index_coord_name].values
 
-    grid_indices = ds_ml_ready[mapping_name][result_sample_indices].values
+    grid_indices = ds_ml_ready[mapping_name].sel(
+        {sample_index_coord_name: result_sample_indices}
+    ).values
 
     grid_coords = get_grid_coordinates(ds_ml_ready, grid_index_name)
     grid_index_shape = ds_ml_ready[grid_index_name].shape
@@ -2074,11 +2054,15 @@ def run_hdbscan(
         }
     )
 
+    labels_array = np.asarray(clustering_result['labels'])
+    cluster_labels = sorted(int(lbl) for lbl in np.unique(labels_array) if lbl >= 0)
+
     return {
         'clustering_results': _clustering_result_to_dataset(clustering_result),
         'clustering_model': clustering_result.get('model'),
         'dbscan_results': dbscan_results,
         'background_label': background_label,
+        'cluster_labels': cluster_labels,
     }
 
 
@@ -2606,4 +2590,202 @@ def full_dbscan_iteration(
         cluster_stats_compute_pairwise_differences=cluster_stats_compute_pairwise_differences
         )
 
+
+def filter_normalized_by_cluster(
+        ds_normalized,
+        clustering_results,
+        cluster_label=-1,
+        dataset_name='ml_data_clean',
+        normalization_name=None,
+        ):
+    """Subset the normalised ML Dataset to samples belonging to a single cluster.
+
+    Selects all samples whose label in *clustering_results* matches
+    *cluster_label* and returns a filtered copy of the normalised dataset
+    containing only those samples.  The full ``sample_index_to_grid_index``
+    mapping is preserved so the filtered dataset can be passed directly to
+    :func:`run_hdbscan` for a second-pass clustering.
+
+    Designed as a single-item primitive so it is compatible with a future
+    ``map_over`` fan-out over multiple cluster labels without any changes to
+    this function or its op spec.
+
+    Args:
+        ds_normalized (xr.Dataset): Normalised ML dataset produced by
+            :func:`normalize_data`.
+        clustering_results (xr.Dataset): Clustering result from
+            :func:`run_hdbscan`.
+        cluster_label (int): Label of the cluster to isolate.  Use ``-1``
+            (default) to select noise points for re-clustering.  Any
+            non-negative integer selects that specific cluster for
+            sub-cluster refinement.
+        dataset_name (str): Base ML dataset name.  Defaults to
+            ``'ml_data_clean'``.
+        normalization_name (str): Normalization result suffix used to locate
+            the normalised feature variable
+            (``{dataset_name}_{normalization_name}``).
+
+    Returns:
+        dict: ``{'ds_normalized_filtered': xr.Dataset}`` — a copy of
+        *ds_normalized* whose normalised feature variable is subsetted to
+        the requested cluster's samples.  The full
+        ``sample_index_to_grid_index`` mapping is retained.
+
+    Raises:
+        ValueError: If *cluster_label* is not present in *clustering_results*
+            or if the normalization variable is not found in *ds_normalized*.
+    """
+    clustering_result = _coerce_clustering_result(clustering_results)
+    labels = np.asarray(clustering_result['labels'])
+    sample_indices = np.asarray(clustering_result['sample_indices'])
+
+    mask = labels == cluster_label
+    if not np.any(mask):
+        available = sorted(int(lbl) for lbl in np.unique(labels))
+        raise ValueError(
+            f"cluster_label={cluster_label!r} not found in clustering_results. "
+            f"Available labels: {available}"
+        )
+
+    selected_sample_indices = sample_indices[mask]
+    n_selected = len(selected_sample_indices)
+
+    norm_var = f"{dataset_name}_{normalization_name}"
+    if norm_var not in ds_normalized:
+        raise ValueError(
+            f"Normalization variable '{norm_var}' not found in ds_normalized. "
+            f"Available variables: {list(ds_normalized.data_vars)}"
+        )
+
+    sample_index_coord = f"{dataset_name}_sample_index"
+
+    # Select the whole dataset along the sample-index dimension.
+    # This correctly subsets the normalised feature variable AND the
+    # sample_index_to_grid_index mapping in one operation, leaving no
+    # NaN-filled positions from unselected samples.
+    ds_filtered = ds_normalized.sel(
+        {sample_index_coord: selected_sample_indices}
+    )
+
+    logger.info(
+        "filter_normalized_by_cluster: isolated %s samples for cluster_label=%d "
+        "(of %s total), normalization='%s'",
+        f"{n_selected:,}",
+        cluster_label,
+        f"{int(ds_normalized[norm_var].sizes[sample_index_coord]):,}",
+        normalization_name,
+    )
+
+    return {'ds_normalized_filtered': ds_filtered}
+
+
+def merge_clustering_passes(
+        clustering_results_pass1,
+        clustering_results_pass2,
+        ml_result_name,
+        dataset_name='ml_data_clean',
+        normalization_name=None,
+        retain_parent_labels=True,
+        ):
+    """Merge pass-1 and pass-2 clustering results into a single result Dataset.
+
+    Combines a first-pass clustering result with one or more second-pass
+    results obtained by re-clustering a subset of the pass-1 samples (e.g.
+    noise points or a specific cluster).  Child cluster labels are remapped
+    to unique integers that do not collide with pass-1 labels.  Noise points
+    produced by the second pass override the parent label for those samples.
+
+    Designed as a fan-in primitive: *clustering_results_pass2* accepts either
+    a single Dataset or a list of Datasets today (``many: true`` in YAML) and
+    will accept a collected list from a future ``collect:`` step attribute once
+    the recipe executor supports native fan-in — with no changes to this
+    function or its op spec.
+
+    Args:
+        clustering_results_pass1 (xr.Dataset): Clustering result from the
+            first pass of :func:`run_hdbscan`, covering all samples.
+        clustering_results_pass2 (xr.Dataset or list[xr.Dataset]): One or
+            more clustering result Datasets from second-pass
+            :func:`run_hdbscan` calls, each covering a subset of the pass-1
+            samples.  A single Dataset is wrapped into a list automatically.
+        ml_result_name (str): Name assigned to the merged result for
+            downstream tracking.
+        dataset_name (str): Base ML dataset name.  Defaults to
+            ``'ml_data_clean'``.
+        normalization_name (str or None): Normalization result suffix stored
+            in result metadata.  Defaults to None.
+        retain_parent_labels (bool): When True, stores the original pass-1
+            label for every sample as a ``parent_labels`` variable alongside
+            the merged labels, enabling parent→child lineage queries.
+            Defaults to True.
+
+    Returns:
+        dict: ``{'clustering_results': xr.Dataset}`` — a merged Dataset with
+        the same sample scope as *clustering_results_pass1*.  Child cluster
+        labels are offset above the highest pass-1 label so they never
+        collide.  Includes a ``parent_labels`` variable when
+        *retain_parent_labels* is True.
+    """
+    pass1 = _coerce_clustering_result(clustering_results_pass1)
+    pass1_labels = np.asarray(pass1['labels'])
+    pass1_sample_indices = np.asarray(pass1['sample_indices'])
+
+    # Normalise pass2 to a list — supports single Dataset or collected list
+    if isinstance(clustering_results_pass2, (list, tuple)):
+        pass2_list = list(clustering_results_pass2)
+    else:
+        pass2_list = [clustering_results_pass2]
+
+    # Seed merged labels from pass1; parent labels are a static snapshot
+    merged_labels = pass1_labels.copy()
+    parent_labels = pass1_labels.copy()
+
+    # Pre-build a lookup from sample_index value → position in merged_labels
+    sample_idx_to_pos = {int(idx): pos for pos, idx in enumerate(pass1_sample_indices)}
+
+    # Start label offset above the highest pass-1 cluster (0 if all noise)
+    pass1_non_noise = pass1_labels[pass1_labels >= 0]
+    running_offset = int(pass1_non_noise.max()) + 1 if len(pass1_non_noise) > 0 else 0
+
+    for pass2_result in pass2_list:
+        child = _coerce_clustering_result(pass2_result)
+        child_labels = np.asarray(child['labels'])
+        child_sample_indices = np.asarray(child['sample_indices'])
+
+        for child_sample_idx, child_label in zip(child_sample_indices, child_labels):
+            pos = sample_idx_to_pos.get(int(child_sample_idx))
+            if pos is None:
+                raise ValueError(
+                    f"pass2 sample_index {child_sample_idx!r} not found in pass1 "
+                    f"sample_indices. Ensure pass2 results were produced from "
+                    f"samples that are a subset of the pass1 dataset."
+                )
+            merged_labels[pos] = (
+                -1 if int(child_label) < 0 else running_offset + int(child_label)
+            )
+
+        child_non_noise = child_labels[child_labels >= 0]
+        if len(child_non_noise) > 0:
+            running_offset += int(child_non_noise.max()) + 1
+
+    logger.info(
+        "merge_clustering_passes: merged %d pass-2 result(s) into pass-1 "
+        "(%s samples). Unique merged labels: %s",
+        len(pass2_list),
+        f"{len(pass1_labels):,}",
+        sorted(int(lbl) for lbl in np.unique(merged_labels)),
+    )
+
+    merged_result = {
+        'labels': merged_labels,
+        'sample_indices': pass1_sample_indices,
+        'ml_result_name': ml_result_name,
+        'dataset_name': dataset_name,
+        'normalization_name': normalization_name,
+        'n_pass2_results': len(pass2_list),
+    }
+    if retain_parent_labels:
+        merged_result['parent_labels'] = parent_labels
+
+    return {'clustering_results': _clustering_result_to_dataset(merged_result)}
 
