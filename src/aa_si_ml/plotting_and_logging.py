@@ -490,7 +490,7 @@ def plot_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_dat
     plt.subplots_adjust(bottom=bottom_margin, right=0.88)
     
     if save_path is not None:
-        fig.savefig(save_path, dpi=300, bbox_inches='tight')
+        fig.savefig(save_path, dpi=100, bbox_inches='tight')
         print(f"Figure saved to: {save_path}")
         plt.close(fig)
     else:
