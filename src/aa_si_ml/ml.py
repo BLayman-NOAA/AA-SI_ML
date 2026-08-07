@@ -17,6 +17,12 @@ import echopype as ep
 from aa_si_visualization import echogram
 from aa_si_utils import utils
 
+from .channels import (
+    channel_frequencies_khz,
+    frequency_label,
+    frequency_sort_order,
+    second_lowest_frequency_index,
+)
 from .constants import DEFAULT_CLUSTER_COLORS, SV_MIN_VALID, SV_MAX_VALID
 from .ml_algorithms import (
     apply_dbscan_clustering,
@@ -721,7 +727,64 @@ def reshape_data_for_ml(ds_Sv, data_var='Sv_corrected', dataset_name='ml_data_cl
     return ds_ml_ready
 
 
-def add_auxiliary_features(ds_ml_ready, dataset_name='ml_data_clean', features=None, echodata=None, ds_sv=None):
+def _sample_on_grid(da, ping_dim, range_dim, ping_indices, range_indices):
+    """Sample a per-cell variable at flattened ``(ping, range)`` grid positions.
+
+    Args:
+        da (xr.DataArray): Variable to sample. A ``channel`` dimension, if
+            present, is averaged away first. May be 2-D over
+            ``(ping_dim, range_dim)`` or 1-D over the range axis (the MVBS
+            case, where the variable *is* the range coordinate).
+        ping_dim (str): Name of the ping dimension.
+        range_dim (str): Name of the range dimension.
+        ping_indices (np.ndarray): Per-sample ping positions.
+        range_indices (np.ndarray): Per-sample range positions.
+
+    Returns:
+        np.ndarray: 1-D array of shape ``(n_samples,)``.
+    """
+    if 'channel' in da.dims:
+        da = da.mean(dim='channel')
+    if da.values.ndim == 1:
+        return da.values[range_indices]
+    da = da.transpose(ping_dim, range_dim)
+    return da.values[ping_indices, range_indices]
+
+
+def _as_seafloor_line(seafloor_depth):
+    """Normalize a supplied seafloor line to a 1-D ``(ping_time,)`` DataArray.
+
+    Accepts a single DataArray, or the list of per-segment DataArrays a
+    per-file ``map_over`` step produces (concatenated along ``ping_time`` in
+    the order given, which is the segment order the executor folds them in).
+    A ``channel`` dimension is averaged away so a raw
+    ``detected_seafloor_depth`` slice also works.
+
+    Args:
+        seafloor_depth: DataArray, or list/tuple of DataArrays.
+
+    Returns:
+        xr.DataArray: 1-D line indexed by ``ping_time``.
+
+    Raises:
+        ValueError: If an empty sequence is supplied.
+    """
+    if isinstance(seafloor_depth, (list, tuple)):
+        segments = [s for s in seafloor_depth if s is not None]
+        if not segments:
+            raise ValueError("seafloor_depth sequence contains no arrays")
+        line = segments[0] if len(segments) == 1 else xr.concat(
+            segments, dim='ping_time'
+        )
+    else:
+        line = seafloor_depth
+
+    if 'channel' in getattr(line, 'dims', ()):
+        line = line.mean(dim='channel')
+    return line
+
+
+def add_auxiliary_features(ds_ml_ready, dataset_name='ml_data_clean', features=None, echodata=None, ds_sv=None, seafloor_depth=None):
     """Append auxiliary coordinate-derived features to the flattened ML dataset.
 
     Slots between :func:`reshape_data_for_ml` and :func:`normalize_data` in
@@ -743,12 +806,33 @@ def add_auxiliary_features(ds_ml_ready, dataset_name='ml_data_clean', features=N
             ``(n_samples,)``.  When ``None`` the function is a no-op.
         echodata: EchoData object providing
             ``echodata["Vendor_specific"]["detected_seafloor_depth"]``
-            (dims ``channel × ping_time``).  Required when
-            ``'seafloor_depth'`` or ``'altitude'`` is requested.
+            (dims ``channel × ping_time``), from which the seafloor line is
+            taken as the mean across channels.  Required when
+            ``'seafloor_depth'`` or ``'altitude'`` is requested and
+            ``seafloor_depth`` is not supplied.  Ignored when it is.
         ds_sv (xr.Dataset or None): Dataset returned by
             :func:`compute_per_cell_statistics`, containing pre-computed
             per-MVBS-cell statistics (e.g. ``cell_cv``).  Required when
             ``'cell_cv'`` is requested.
+        seafloor_depth: Pre-detected seafloor line as a 1-D
+            ``(ping_time,)`` :class:`xarray.DataArray`, e.g. the output of a
+            ``detect_seafloor`` step.  Takes precedence over *echodata*, so
+            the seafloor used by the ML features is the same line chosen by
+            whichever detection method the pipeline ran, rather than a
+            channel mean recomputed here.  A list/tuple of per-segment
+            DataArrays is also accepted and concatenated along ``ping_time``
+            in the order given, which is the shape a per-file ``map_over``
+            step's output takes.  A ``channel`` dimension, if present, is
+            averaged away for backward compatibility.
+
+            Vertical reference: ``'altitude'`` is a difference
+            (``seafloor - sample``), so a constant offset shared by both
+            terms cancels and the frame does not matter as long as they
+            agree.  They normally do: ``detect_seafloor`` promotes its line
+            to surface-referenced only when its ``ds_Sv`` carries ``depth``,
+            which is the same condition under which ``depth`` reaches this
+            dataset, and ``'altitude'`` prefers ``depth`` over
+            ``echo_range`` to pair with it.
 
     Returns:
         xr.Dataset: Dataset with auxiliary features appended to
@@ -766,10 +850,12 @@ def add_auxiliary_features(ds_ml_ready, dataset_name='ml_data_clean', features=N
         (f if isinstance(f, str) else f.get('name', '')) in SEAFLOOR_FEATURES
         for f in features
     )
-    if seafloor_requested and echodata is None:
+    if seafloor_requested and echodata is None and seafloor_depth is None:
         raise ValueError(
-            "'seafloor_depth' and 'altitude' require the 'echodata' parameter "
-            "to access detected_seafloor_depth from Vendor_specific data."
+            "'seafloor_depth' and 'altitude' require either the "
+            "'seafloor_depth' parameter (a pre-detected 1-D line) or the "
+            "'echodata' parameter (to read detected_seafloor_depth from "
+            "Vendor_specific data)."
         )
 
     cell_stat_features = {'cell_cv'}
@@ -810,13 +896,19 @@ def add_auxiliary_features(ds_ml_ready, dataset_name='ml_data_clean', features=N
     # --- Pre-compute seafloor depth on the dataset's ping grid if needed ---
     seafloor_on_grid = None
     if seafloor_requested:
-        raw_sfd = echodata["Vendor_specific"]["detected_seafloor_depth"]
-        # raw_sfd dims: (channel, ping_time_raw)
-        # Average across channels, then resample to dataset ping times
-        sfd_mean = raw_sfd.mean(dim='channel')  # (ping_time_raw,)
+        if seafloor_depth is not None:
+            # A line already chosen by a detect_seafloor step. Preferred over
+            # the channel mean below: the pipeline's masking uses this same
+            # line, so the ML features stay consistent with it.
+            sfd_line = _as_seafloor_line(seafloor_depth)
+        else:
+            raw_sfd = echodata["Vendor_specific"]["detected_seafloor_depth"]
+            # raw_sfd dims: (channel, ping_time_raw)
+            # Average across channels, then resample to dataset ping times
+            sfd_line = raw_sfd.mean(dim='channel')  # (ping_time_raw,)
         ds_ping_times = ds_ml_ready[ping_dim]   # binned ping times
         # Nearest-neighbour resampling
-        seafloor_on_grid = sfd_mean.sel(
+        seafloor_on_grid = sfd_line.sel(
             ping_time=ds_ping_times, method='nearest'
         ).values  # (n_pings_in_grid,)
 
@@ -835,20 +927,14 @@ def add_auxiliary_features(ds_ml_ready, dataset_name='ml_data_clean', features=N
                     "'depth' feature requires 'echo_range' variable in the dataset. "
                     "Ensure compute_Sv() has been called before reshape_data_for_ml()."
                 )
-            echo_range = ds_ml_ready['echo_range']
-            # echo_range dims: (channel, ping_dim, range_dim) — mean across channels
-            if 'channel' in echo_range.dims:
-                echo_range_2d = echo_range.mean(dim='channel')
-            else:
-                echo_range_2d = echo_range
-            if echo_range_2d.values.ndim == 1:
-                # MVBS case: echo_range IS the range coordinate (1D depth values)
-                values = echo_range_2d.values[range_indices]
-            else:
-                # Raw Sv case: echo_range is a (ping_dim, range_dim) variable
-                # Explicitly transpose to match grid_coords order before numpy indexing
-                echo_range_2d = echo_range_2d.transpose(ping_dim, range_dim)
-                values = echo_range_2d.values[ping_indices, range_indices]
+            # Stays on echo_range regardless of whether a 'depth' variable
+            # exists: this feature is the sample's own range reading, and
+            # changing its reference frame would change existing models'
+            # inputs. Only 'altitude' needs frame agreement with the seafloor.
+            values = _sample_on_grid(
+                ds_ml_ready['echo_range'], ping_dim, range_dim,
+                ping_indices, range_indices,
+            )
 
         elif name == 'ping_time_seconds':
             ping_times_ns = ds_ml_ready[ping_dim].values.astype('float64')
@@ -860,21 +946,26 @@ def add_auxiliary_features(ds_ml_ready, dataset_name='ml_data_clean', features=N
             values = seafloor_on_grid[ping_indices]
 
         elif name == 'altitude':
-            if 'echo_range' not in ds_ml_ready:
+            # A difference, so any constant vertical offset shared by both
+            # terms cancels: (seafloor + c) - (sample + c) == seafloor - sample.
+            # Frame choice therefore does not matter as long as both sides
+            # agree, and they normally do -- detect_seafloor promotes its line
+            # to surface-referenced only when its ds_Sv carries depth, the same
+            # condition under which depth reaches this dataset.
+            # 'depth' is preferred purely to pair with that promoted line.
+            if 'depth' in ds_ml_ready:
+                vertical_var = 'depth'
+            elif 'echo_range' in ds_ml_ready:
+                vertical_var = 'echo_range'
+            else:
                 raise ValueError(
-                    "'altitude' feature requires 'echo_range' variable in the dataset."
+                    "'altitude' feature requires a 'depth' or 'echo_range' "
+                    "variable in the dataset."
                 )
-            echo_range = ds_ml_ready['echo_range']
-            if 'channel' in echo_range.dims:
-                echo_range_2d = echo_range.mean(dim='channel')
-            else:
-                echo_range_2d = echo_range
-            if echo_range_2d.values.ndim == 1:
-                depth_values = echo_range_2d.values[range_indices]
-            else:
-                echo_range_2d = echo_range_2d.transpose(ping_dim, range_dim)
-                depth_values = echo_range_2d.values[ping_indices, range_indices]
-            values = seafloor_on_grid[ping_indices] - depth_values
+            values = seafloor_on_grid[ping_indices] - _sample_on_grid(
+                ds_ml_ready[vertical_var], ping_dim, range_dim,
+                ping_indices, range_indices,
+            )
 
         elif name == 'cell_cv':
             if ds_sv is None:
@@ -1521,15 +1612,19 @@ def extract_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_
             features explicitly. When None, flattened ML features are used
             for backward compatibility.
         compute_pairwise_diffs (bool): If True and *sv_data_var* is
-            provided, compute pairwise differences between channels in
-            addition to original channel values. Defaults to False.
+            provided, compute differences between each channel and the
+            second-lowest-frequency channel in addition to original channel
+            values. Defaults to False.
 
     Returns:
         dict: Dictionary containing:
             - ``'cluster_stats'``: list of dicts with per-cluster statistics.
             - ``'noise_stats'``: dict with noise statistics (if present).
             - ``'metadata'``: dict with overall information.
-            - ``'feature_coords'``: array of feature names.
+            - ``'feature_coords'``: array of feature names, channels first in
+              order of increasing frequency, then any differences.
+            - ``'feature_labels'``: list of short display labels, one per
+              feature, using channel frequency where it is known.
             - ``'feature_dim_name'``: str name of feature dimension.
             - ``'data_description'``: str describing source data.
     """
@@ -1587,24 +1682,50 @@ def extract_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_
         source_data = sv_flat.T
         cluster_labels = cluster_flat
         
+        frequencies_khz = channel_frequencies_khz(ds_ml_ready, feature_coords)
+
+        # Channels are stored in transducer install order, so reorder them by
+        # increasing frequency for reporting.
+        channel_order = frequency_sort_order(frequencies_khz)
+        if channel_order is not None:
+            source_data = source_data[:, channel_order]
+            feature_coords = feature_coords[channel_order]
+            frequencies_khz = [frequencies_khz[index] for index in channel_order]
+
+        feature_labels = [
+            frequency_label(freq) or str(name)
+            for freq, name in zip(frequencies_khz, feature_coords)
+        ]
+
         # Optionally compute pairwise differences
-        if compute_pairwise_diffs:
-            # Compute pairwise differences (each channel minus first channel)
-            baseline_channel_data = source_data[:, 0:1]  # Keep 2D for broadcasting
-            diff_data = source_data[:, 1:] - baseline_channel_data
-            
+        if compute_pairwise_diffs and n_channels > 1:
+            # Differences are taken against the second-lowest frequency, which
+            # is the conventional reference channel for frequency response.
+            baseline_index = second_lowest_frequency_index(frequencies_khz)
+            if baseline_index is None:
+                baseline_index = 0
+            other_indices = [index for index in range(n_channels) if index != baseline_index]
+
+            baseline_channel_data = source_data[:, baseline_index:baseline_index + 1]  # Keep 2D for broadcasting
+            diff_data = source_data[:, other_indices] - baseline_channel_data
+
             # Concatenate original channels with differences
             source_data = np.concatenate([source_data, diff_data], axis=1)
-            
+
             # Update feature names to include differences
-            baseline_freq = feature_coords[0]
-            diff_names = [f"{freq}-{baseline_freq}_diff" for freq in feature_coords[1:]]
+            baseline_channel = feature_coords[baseline_index]
+            diff_names = [f"{feature_coords[index]}-{baseline_channel}_diff" for index in other_indices]
             feature_coords = np.concatenate([feature_coords, diff_names])
-            
-            data_description = f"Original Sv data: {sv_data_var} (with pairwise differences)"
+
+            baseline_label = feature_labels[baseline_index]
+            feature_labels += [
+                f"{feature_labels[index]} - {baseline_label}" for index in other_indices
+            ]
+
+            data_description = f"Original Sv data: {sv_data_var} (differences vs {baseline_label})"
         else:
             data_description = f"Original Sv data: {sv_data_var}"
-        
+
     else:
         # Use flattened ML feature data.
         source_data_name = dataset_name
@@ -1620,7 +1741,8 @@ def extract_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_
         feature_dim_name = [dim for dim in ds_ml_ready[source_data_name].dims 
                             if not dim.endswith('_sample_index')][0]
         feature_coords = ds_ml_ready[source_data_name].coords[feature_dim_name].values
-        
+        feature_labels = [str(name) for name in feature_coords]
+
         if sv_data_var == ML_FEATURE_STATS_SOURCE:
             data_description = f"ML features: {source_data_name}"
         else:
@@ -1703,6 +1825,7 @@ def extract_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_
         'noise_stats': noise_stats,
         'metadata': metadata,
         'feature_coords': feature_coords,
+        'feature_labels': feature_labels,
         'feature_dim_name': feature_dim_name,
         'data_description': data_description
     }
@@ -1712,8 +1835,10 @@ def extract_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_
 
 def remove_noise(
         ds_Sv,
-        noise_range_sample_num=10,
-        noise_ping_num=5,
+        ping_num=5,
+        range_sample_num=10,
+        background_noise_max=None,
+        SNR_threshold="3.0dB",
         assign_to_sv=True
         ):
     """Remove background noise from Sv data using echopype.
@@ -1723,10 +1848,15 @@ def remove_noise(
 
     Args:
         ds_Sv (xr.Dataset): Dataset with ``Sv`` data.
-        noise_range_sample_num (int): Number of range samples for noise
-            estimation. Defaults to 10.
-        noise_ping_num (int): Number of pings for noise estimation.
+        ping_num (int): Number of pings for noise estimation.
             Defaults to 5.
+        range_sample_num (int): Number of range samples for noise
+            estimation. Defaults to 10.
+        background_noise_max (str or None): Upper limit on the estimated
+            noise level, e.g. ``'-125dB'``. ``None`` leaves the estimate
+            unbounded. Defaults to None.
+        SNR_threshold (str): Signal-to-noise ratio below which corrected
+            samples are masked out. Defaults to '3.0dB'.
         assign_to_sv (bool): Copy ``Sv_corrected`` into ``Sv``.
             Defaults to True.
 
@@ -1736,8 +1866,10 @@ def remove_noise(
 
     ds_Sv_clean = ep.clean.remove_background_noise(
         ds_Sv,
-        range_sample_num=noise_range_sample_num,
-        ping_num=noise_ping_num,
+        ping_num=ping_num,
+        range_sample_num=range_sample_num,
+        background_noise_max=background_noise_max,
+        SNR_threshold=SNR_threshold,
     )
     if assign_to_sv:
         ds_Sv_clean["Sv"] = ds_Sv_clean["Sv_corrected"]
@@ -1787,8 +1919,8 @@ def data_preprocessing_pipeline(
     if remove_background_noise:
         ds_Sv_clean = remove_noise(
             ds_Sv,
-            noise_range_sample_num=noise_range_sample_num,
-            noise_ping_num=noise_ping_num,
+            range_sample_num=noise_range_sample_num,
+            ping_num=noise_ping_num,
         )
     else:
         ds_Sv_clean = ds_Sv
@@ -1976,9 +2108,14 @@ def reshape_and_normalize_data(
 
 
 def _resolve_plot_window(plot_window):
-    if plot_window is None or len(plot_window) < 4:
-        return [0, 1200, 0, 600]
-    return plot_window
+    """Pad a [min_depth, max_depth, ping_min, ping_max] window to four slots.
+
+    Missing entries stay None so the plotting layer auto-detects the full depth
+    and ping extent of the data.
+    """
+    window = list(plot_window) if plot_window else []
+    window += [None] * (4 - len(window))
+    return window
 
 
 def _build_overlay_lines(overlay_line_var):
@@ -2112,6 +2249,7 @@ def _plot_single_clustering_result(
         y_to_x_aspect_ratio_override=None,
         cluster_stats_sv_data_var="Sv",
         cluster_stats_compute_pairwise_differences=True,
+        cluster_stats_dpi=200,
         save_image=None,
         save_formats=None,
         save_dir=None,
@@ -2160,7 +2298,7 @@ def _plot_single_clustering_result(
         save_formats=save_formats,
         save_dir=save_dir,
         show=show,
-        dpi=dpi,
+        dpi=dpi if cluster_stats_dpi is None else cluster_stats_dpi,
     )
 
     hierarchy_model = clustering_model or clustering_result.get('model')
@@ -2229,6 +2367,7 @@ def plot_clustering_report(
         y_to_x_aspect_ratio_override=None,
         cluster_stats_sv_data_var="Sv",
         cluster_stats_compute_pairwise_differences=True,
+        cluster_stats_dpi=200,
         save_image=None,
         save_formats=None,
         save_dir=None,
@@ -2240,6 +2379,10 @@ def plot_clustering_report(
     Set ``cluster_stats_sv_data_var='ml_features'`` to plot statistics for
     the flattened ML features used by clustering instead of gridded Sv channel
     values.
+
+    The cluster statistics figure carries a lot of small text, so it is
+    rendered at ``cluster_stats_dpi`` rather than the report-wide ``dpi``
+    used by the much larger echogram. Pass None to tie it back to ``dpi``.
     """
     if isinstance(clustering_results, list):
         for index, clustering_result in enumerate(clustering_results, start=1):
@@ -2260,6 +2403,7 @@ def plot_clustering_report(
                 y_to_x_aspect_ratio_override=y_to_x_aspect_ratio_override,
                 cluster_stats_sv_data_var=cluster_stats_sv_data_var,
                 cluster_stats_compute_pairwise_differences=cluster_stats_compute_pairwise_differences,
+                cluster_stats_dpi=cluster_stats_dpi,
                 save_image=save_image,
                 save_formats=save_formats,
                 save_dir=save_dir,
@@ -2285,6 +2429,7 @@ def plot_clustering_report(
         y_to_x_aspect_ratio_override=y_to_x_aspect_ratio_override,
         cluster_stats_sv_data_var=cluster_stats_sv_data_var,
         cluster_stats_compute_pairwise_differences=cluster_stats_compute_pairwise_differences,
+        cluster_stats_dpi=cluster_stats_dpi,
         save_image=save_image,
         save_formats=save_formats,
         save_dir=save_dir,

@@ -10,7 +10,7 @@ configure_matplotlib_backend()
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
-from .constants import DEFAULT_CLUSTER_COLORS
+from .constants import DEFAULT_CLUSTER_COLORS, FEATURE_EDGE_COLORS
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +212,9 @@ def plot_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_dat
 
     Features are grouped by type (Sv vs differences) with shared y-axes.
     All Sv features share one y-axis, all difference features share another.
+    Bars are filled with the cluster colour and outlined with a per-feature
+    colour that the legend repeats, so each bar in a cluster group can be
+    matched back to its channel.
 
     Args:
         ds_ml_ready (xr.Dataset): Dataset containing cluster labels and
@@ -230,12 +233,14 @@ def plot_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_dat
             Defaults to True. Noise bars are rendered in white.
         cluster_colors (list[str] or None): Hex colour strings.
             Defaults to None (uses built-in palette).
-        figsize (tuple): Figure size. Defaults to (12, 6).
+        figsize (tuple): Plot area size. The figure is made taller than
+            this to hold the legend. Defaults to (12, 6).
         title (str or None): Custom title. Defaults to None.
         save_path (str or None): Path to save figure. Defaults to None.
         compute_pairwise_diffs (bool): If True and *sv_data_var* is
-            provided, compute pairwise differences between channels
-            and plot them on a separate y-axis. Defaults to False.
+            provided, compute differences between each channel and the
+            second-lowest-frequency channel and plot them on a separate
+            y-axis. Defaults to False.
 
     Returns:
         tuple: ``(fig, axes_list, stats_dict)``.
@@ -266,6 +271,14 @@ def plot_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_dat
     n_clusters = len(clusters_to_plot)
     n_features = len(feature_coords)
     cluster_ids = [stats['Cluster'] for stats in clusters_to_plot]
+
+    feature_labels = stats_dict.get('feature_labels')
+    if not feature_labels:
+        feature_labels = [str(name) for name in feature_coords]
+    # Bar fill shows the cluster, so features are told apart by edge color.
+    feature_edge_colors = [
+        FEATURE_EDGE_COLORS[j % len(FEATURE_EDGE_COLORS)] for j in range(n_features)
+    ]
 
     means = np.zeros((n_clusters, n_features))
     stds = np.zeros((n_clusters, n_features))
@@ -381,7 +394,15 @@ def plot_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_dat
         ml_y_min_aligned = None
         ml_y_max_aligned = None
 
-    fig, ax = plt.subplots(figsize=figsize)
+    # Grow the figure instead of the axes so the legend below the rotated
+    # cluster tick labels never overlaps them.
+    legend_columns = 2 if n_features > 5 else 1
+    legend_rows = int(np.ceil(n_features / legend_columns))
+    legend_height = 0.4 + legend_rows * 0.22
+    fig_width, fig_height = figsize
+    fig_height += legend_height
+
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
     x = np.arange(n_clusters)
     width = 0.8 / n_features
 
@@ -438,7 +459,7 @@ def plot_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_dat
                     color=color,
                     alpha=1,
                     capsize=3,
-                    edgecolor='black',
+                    edgecolor=feature_edge_colors[j],
                     linewidth=2
                 )
         
@@ -461,14 +482,13 @@ def plot_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_dat
             ax_feature.axhline(y=3, color='blue', linestyle=':', linewidth=2, alpha=0.7, zorder=2)
             ax_feature.axhline(y=-3, color='blue', linestyle=':', linewidth=2, alpha=0.7, zorder=2)
 
-    feature_handles = []
-    feature_labels = []
-    for j, feature_name in enumerate(feature_coords):
-        feature_handles.append(Line2D([0], [0], marker='s', color='w', 
-                                     markerfacecolor='gray', markersize=8, 
-                                     markeredgecolor='black', linewidth=0))
-        feature_labels.append(str(feature_name))
-    
+    feature_handles = [
+        Line2D([0], [0], marker='s', color='w',
+               markerfacecolor='lightgray', markersize=11,
+               markeredgecolor=edge_color, markeredgewidth=2, linewidth=0)
+        for edge_color in feature_edge_colors
+    ]
+
     ax.set_xlabel('Cluster', fontsize=12)
     if title is None:
         if stat_type == 'mean':
@@ -482,13 +502,19 @@ def plot_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_dat
     ax.set_xticklabels([f'Cluster {cid}' if cid != -1 else 'Noise' for cid in cluster_ids], 
                        rotation=45, ha='right')
     
-    ax.legend(feature_handles, feature_labels, loc='upper center', bbox_to_anchor=(0.5, -0.15),
-             ncol=1, fontsize=8, title='Features', frameon=True)
-    
-    plt.tight_layout()
-    bottom_margin = 0.2 + (n_features * 0.03)
-    plt.subplots_adjust(bottom=bottom_margin, right=0.88)
-    
+    # Reserve the legend band plus room for the rotated tick labels and the
+    # x-axis label, all measured in inches against the grown figure height.
+    tick_label_height = 1.0
+    title_height = 0.8
+    fig.subplots_adjust(
+        bottom=(legend_height + tick_label_height) / fig_height,
+        top=1 - title_height / fig_height,
+        right=0.88,
+    )
+    fig.legend(feature_handles, feature_labels, loc='lower center',
+               bbox_to_anchor=(0.5, 0.02 / fig_height), ncol=legend_columns,
+               fontsize=9, title='Features', frameon=True)
+
     if save_path is not None:
         fig.savefig(save_path, dpi=100, bbox_inches='tight')
         print(f"Figure saved to: {save_path}")
