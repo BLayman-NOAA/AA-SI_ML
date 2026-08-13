@@ -1959,7 +1959,7 @@ def data_preprocessing_pipeline(
         max_depth=plot_window[1],
         ping_min=plot_window[2],
         ping_max=plot_window[3],
-        x_axis_units="seconds",
+        x_axis_units="datetime",
         y_axis_units="meters",
         echodata=echodata,
         y_to_x_aspect_ratio_override=y_to_x_aspect_ratio_override
@@ -1972,7 +1972,7 @@ def data_preprocessing_pipeline(
         max_depth=plot_window[1],
         ping_min=plot_window[2],
         ping_max=plot_window[3],
-        x_axis_units="seconds",
+        x_axis_units="datetime",
         y_axis_units="meters",
         echodata=echodata,
         y_to_x_aspect_ratio_override=y_to_x_aspect_ratio_override,
@@ -2100,7 +2100,7 @@ def reshape_and_normalize_data(
         ping_min=plot_window[2],
         ping_max=plot_window[3],
         y_to_x_aspect_ratio_override=y_to_x_aspect_ratio_override,
-        x_axis_units="seconds",
+        x_axis_units="datetime",
         y_axis_units="meters"
     )
 
@@ -2242,7 +2242,7 @@ def _plot_single_clustering_result(
         clustering_model=None,
         ds_Sv=None,
         plot_window=None,
-        x_axis_units="seconds",
+        x_axis_units="datetime",
         y_axis_units="meters",
         overlay_line_var=None,
         cluster_colors=None,
@@ -2255,6 +2255,8 @@ def _plot_single_clustering_result(
         save_dir=None,
         show=None,
         dpi=None,
+        time_min=None,
+        time_max=None,
         ):
     resolved_plot_window = _resolve_plot_window(plot_window)
     resolved_cluster_colors = cluster_colors or DEFAULT_CLUSTER_COLORS
@@ -2280,6 +2282,8 @@ def _plot_single_clustering_result(
         save_dir=save_dir,
         show=show,
         dpi=dpi,
+        time_min=time_min,
+        time_max=time_max,
     )
 
     cluster_stats_normalization_name = None
@@ -2360,7 +2364,7 @@ def plot_clustering_report(
         clustering_model=None,
         ds_Sv=None,
         plot_window=None,
-        x_axis_units="seconds",
+        x_axis_units="datetime",
         y_axis_units="meters",
         overlay_line_var=None,
         cluster_colors=None,
@@ -2373,6 +2377,8 @@ def plot_clustering_report(
         save_dir=None,
         show=None,
         dpi=None,
+        time_min=None,
+        time_max=None,
         ):
     """Render the full clustering report for one or more clustering results.
 
@@ -2383,6 +2389,10 @@ def plot_clustering_report(
     The cluster statistics figure carries a lot of small text, so it is
     rendered at ``cluster_stats_dpi`` rather than the report-wide ``dpi``
     used by the much larger echogram. Pass None to tie it back to ``dpi``.
+
+    ``time_min`` and ``time_max`` window the echogram by UTC timestamp,
+    taking precedence over the ping bounds in ``plot_window``. Pair them with
+    ``x_axis_units='datetime'`` to label the axis with clock times.
     """
     if isinstance(clustering_results, list):
         for index, clustering_result in enumerate(clustering_results, start=1):
@@ -2409,6 +2419,8 @@ def plot_clustering_report(
                 save_dir=save_dir,
                 show=show,
                 dpi=dpi,
+                time_min=time_min,
+                time_max=time_max,
             )
         return
 
@@ -2435,6 +2447,8 @@ def plot_clustering_report(
         save_dir=save_dir,
         show=show,
         dpi=dpi,
+        time_min=time_min,
+        time_max=time_max,
     )
 
 
@@ -2718,7 +2732,7 @@ def full_dbscan_iteration(
         ping_min=plot_window[2],
         ping_max=plot_window[3],
         y_to_x_aspect_ratio_override=y_to_x_aspect_ratio_override,
-        x_axis_units="seconds",
+        x_axis_units="datetime",
         y_axis_units="meters"
     )
 
@@ -2828,6 +2842,113 @@ def filter_normalized_by_cluster(
         f"{n_selected:,}",
         cluster_label,
         f"{int(ds_normalized[norm_var].sizes[sample_index_coord]):,}",
+        normalization_name,
+    )
+
+    return {'ds_normalized_filtered': ds_filtered}
+
+
+def filter_normalized_by_feature(
+        ds_normalized,
+        feature_name,
+        min_value=None,
+        max_value=None,
+        dataset_name='ml_data_clean',
+        normalization_name=None,
+        ):
+    """Subset the normalised ML Dataset to samples inside a raw-feature range.
+
+    Thresholds are applied to the pre-normalization values in *dataset_name*,
+    so they are given in the feature's own units (dB for ``mean_Sv``) rather
+    than in transformed units.  The normalised feature variable is carried
+    through untouched, which lets a second-pass :func:`run_hdbscan` reuse the
+    first pass's normalization instead of re-fitting a scaler on the subset.
+
+    Chains after :func:`filter_normalized_by_cluster` to isolate, for example,
+    the high-Sv part of the first pass's noise points.
+
+    Args:
+        ds_normalized (xr.Dataset): Normalised ML dataset from
+            :func:`normalize_data`, or a filtered copy of one.
+        feature_name (str): Feature to threshold on, matching a label in the
+            feature coordinate (e.g. ``'mean_Sv'``).
+        min_value (float or None): Keep samples at or above this value.
+            Defaults to None for no lower bound.
+        max_value (float or None): Keep samples at or below this value.
+            Defaults to None for no upper bound.
+        dataset_name (str): Base ML dataset name.  Defaults to
+            ``'ml_data_clean'``.
+        normalization_name (str): Normalization result suffix used to locate
+            the normalised feature variable
+            (``{dataset_name}_{normalization_name}``).
+
+    Returns:
+        dict: ``{'ds_normalized_filtered': xr.Dataset}``, a copy of
+        *ds_normalized* subsetted to the samples inside the requested range.
+        The ``sample_index_to_grid_index`` mapping is subsetted with it.
+
+    Raises:
+        ValueError: If both bounds are None, if *feature_name* or the
+            normalization variable is not found, or if no samples fall inside
+            the requested range.
+    """
+    if min_value is None and max_value is None:
+        raise ValueError(
+            "filter_normalized_by_feature requires at least one of "
+            "min_value or max_value."
+        )
+
+    source_data = ds_normalized[dataset_name]
+    sample_index_coord = f'{dataset_name}_sample_index'
+    feature_dim_name = [d for d in source_data.dims if d != sample_index_coord][0]
+    feature_labels = [str(f) for f in source_data.coords[feature_dim_name].values]
+
+    if feature_name not in feature_labels:
+        raise ValueError(
+            f"feature_name={feature_name!r} not found in '{dataset_name}'. "
+            f"Available features: {feature_labels}"
+        )
+
+    norm_var = f'{dataset_name}_{normalization_name}'
+    if norm_var not in ds_normalized:
+        raise ValueError(
+            f"Normalization variable '{norm_var}' not found in ds_normalized. "
+            f"Available variables: {list(ds_normalized.data_vars)}"
+        )
+
+    values = source_data.isel(
+        {feature_dim_name: feature_labels.index(feature_name)}
+    ).values
+
+    mask = np.ones(len(values), dtype=bool)
+    if min_value is not None:
+        mask &= values >= min_value
+    if max_value is not None:
+        mask &= values <= max_value
+
+    if not np.any(mask):
+        raise ValueError(
+            f"No samples fall inside the requested range for {feature_name!r} "
+            f"(min_value={min_value}, max_value={max_value}). Observed range: "
+            f"{np.nanmin(values):.3f} to {np.nanmax(values):.3f}."
+        )
+
+    selected_sample_indices = ds_normalized[sample_index_coord].values[mask]
+
+    # Selecting the whole dataset along the sample-index dimension subsets the
+    # raw features, the normalised features, and the grid mapping together.
+    ds_filtered = ds_normalized.sel(
+        {sample_index_coord: selected_sample_indices}
+    )
+
+    logger.info(
+        "filter_normalized_by_feature: kept %s of %s samples with %s in "
+        "[%s, %s], normalization='%s'",
+        f"{int(mask.sum()):,}",
+        f"{len(values):,}",
+        feature_name,
+        min_value if min_value is not None else '-inf',
+        max_value if max_value is not None else 'inf',
         normalization_name,
     )
 
