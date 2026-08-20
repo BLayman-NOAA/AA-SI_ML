@@ -5,7 +5,7 @@
 import numpy as np
 import xarray as xr
 
-from aa_si_ml import ml
+from aa_si_ml import ml, ml_algorithms
 
 
 def _make_ds_normalized():
@@ -489,3 +489,35 @@ def test_extract_data_and_run_hdbscan_preserves_wrapper_tuple(monkeypatch):
     assert clustering_results is raw_dbscan_results
     assert clustering_results['run_1']['labels'][0] == 0
     assert plotted['count'] == 1
+
+class _FakeClusterer:
+    """Stand-in for a fitted HDBSCAN model carrying only its labels."""
+
+    def __init__(self, labels):
+        self.labels_ = np.asarray(labels)
+
+
+def test_assign_noise_by_soft_membership_handles_no_clusters(monkeypatch):
+    clusterer = _FakeClusterer([-1, -1, -1])
+    monkeypatch.setattr(
+        ml_algorithms.hdbscan,
+        'all_points_membership_vectors',
+        lambda _clusterer: np.zeros(3),
+    )
+
+    labels = ml_algorithms.assign_noise_by_soft_membership(clusterer, threshold=0.1)
+
+    np.testing.assert_array_equal(labels, np.array([-1, -1, -1]))
+
+
+def test_assign_noise_by_soft_membership_reassigns_confident_noise(monkeypatch):
+    clusterer = _FakeClusterer([0, -1, -1])
+    monkeypatch.setattr(
+        ml_algorithms.hdbscan,
+        'all_points_membership_vectors',
+        lambda _clusterer: np.array([[0.9, 0.1], [0.2, 0.8], [0.05, 0.05]]),
+    )
+
+    labels = ml_algorithms.assign_noise_by_soft_membership(clusterer, threshold=0.5)
+
+    np.testing.assert_array_equal(labels, np.array([0, 1, -1]))

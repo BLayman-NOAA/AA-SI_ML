@@ -480,13 +480,14 @@ def compute_per_cell_statistics(
         ping_time_bin="10s",
         statistics=None,
         data_var='Sv',
+        range_var='echo_range',
         ):
     """Compute per-MVBS-cell statistics from fine-resolution Sv data.
 
     Must be called **before** :func:`mask_sparse_bins` and
-    :func:`echopype.commongrid.compute_MVBS` using identical ``range_bin``
-    and ``ping_time_bin`` values so that the resulting cell grid aligns
-    exactly with the MVBS grid.
+    :func:`echopype.commongrid.compute_MVBS` using identical ``range_bin``,
+    ``ping_time_bin`` and ``range_var`` values so that the resulting cell grid
+    aligns exactly with the MVBS grid.
 
     Results are stored as new DataArrays inside a copy of *ds_Sv* with
     distinct dimension names (``cell_ping_time``, ``cell_echo_range``) so
@@ -512,6 +513,11 @@ def compute_per_cell_statistics(
             to ``['cv']``.
         data_var (str): Name of the Sv variable in *ds_Sv*.
             Defaults to ``'Sv'``.
+        range_var (str): Meter-valued variable to bin along, matching the
+            downstream ``compute_MVBS`` call.  ``'echo_range'`` measures from
+            the transducer face, ``'depth'`` from the surface and requires the
+            dataset to carry a depth variable.  Defaults to ``'echo_range'``.
+            The cell dimension names do not change with it.
 
     Returns:
         xr.Dataset: Copy of *ds_Sv* with one new DataArray per statistic
@@ -533,12 +539,15 @@ def compute_per_cell_statistics(
     if data_var not in ds_Sv:
         raise ValueError(f"Data variable '{data_var}' not found in dataset")
 
+    if range_var not in ds_Sv:
+        raise ValueError(f"Range variable '{range_var}' not found in dataset")
+
     ds_out = ds_Sv.copy()
     sv_data = ds_Sv[data_var]
 
     # Build the same interval grids that compute_MVBS uses.
     range_bin_val = float(range_bin.rstrip('m'))
-    range_max = float(ds_Sv['echo_range'].max(skipna=True).values)
+    range_max = float(ds_Sv[range_var].max(skipna=True).values)
     range_edges = np.arange(0, range_max + range_bin_val, range_bin_val)
     range_interval = pd.IntervalIndex.from_breaks(range_edges, closed='left').sort_values()
 
@@ -560,7 +569,7 @@ def compute_per_cell_statistics(
             linear,
             ds_Sv['channel'],
             ds_Sv['ping_time'],
-            ds_Sv['echo_range'],
+            ds_Sv[range_var],
             expected_groups=(None, ping_interval, range_interval),
             isbin=[False, True, True],
             func='nanmean',
@@ -571,7 +580,7 @@ def compute_per_cell_statistics(
             linear,
             ds_Sv['channel'],
             ds_Sv['ping_time'],
-            ds_Sv['echo_range'],
+            ds_Sv[range_var],
             expected_groups=(None, ping_interval, range_interval),
             isbin=[False, True, True],
             func='nanstd',
@@ -592,7 +601,9 @@ def compute_per_cell_statistics(
             coords={
                 'channel': stat_arr.channel.values,
                 'cell_ping_time': np.array([v.left for v in stat_arr.ping_time_bins.values]),
-                'cell_echo_range': np.array([v.left for v in stat_arr.echo_range_bins.values]),
+                'cell_echo_range': np.array(
+                    [v.left for v in stat_arr[f'{range_var}_bins'].values]
+                ),
             },
             attrs={
                 'long_name': f'Per-cell {stat_key.upper()} (linear space)',
@@ -602,6 +613,7 @@ def compute_per_cell_statistics(
                 ),
                 'range_bin': range_bin,
                 'ping_time_bin': ping_time_bin,
+                'range_var': range_var,
                 'source_variable': data_var,
             },
         )

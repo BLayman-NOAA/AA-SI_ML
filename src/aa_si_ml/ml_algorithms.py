@@ -308,10 +308,20 @@ def assign_noise_by_soft_membership(clusterer, threshold=0.1):
 
     Returns:
         np.ndarray: Cluster labels with noise points reassigned if their
-        max probability exceeds threshold.
+        max probability exceeds threshold. Labels are returned unchanged
+        when the fit found no clusters.
     """
     labels = clusterer.labels_.copy()
     soft_clusters = hdbscan.all_points_membership_vectors(clusterer)
+
+    # hdbscan returns a 1-D array of zeros rather than an (n_samples,
+    # n_clusters) matrix when the fit found no clusters, and there is nothing
+    # to reassign noise to in that case.
+    if soft_clusters.ndim < 2 or soft_clusters.shape[1] == 0:
+        logger.info(
+            "No clusters found; leaving all %d points as noise", len(labels)
+        )
+        return labels
 
     noise_mask = labels == -1
     if np.any(noise_mask):
