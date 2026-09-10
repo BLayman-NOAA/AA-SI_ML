@@ -297,6 +297,55 @@ def _run_dbscan_grid(
             }
 
 
+def predict_cluster_labels(model, X, batch_size=200_000):
+    """Assign cluster labels to points the model was not fitted on.
+
+    HDBSCAN is fitted on a subsample when the full dataset is too large to
+    cluster directly, which leaves the unsampled points with no label at all.
+    This projects the fitted structure onto them with
+    ``hdbscan.approximate_predict``, which walks each point down the condensed
+    tree the fit produced and returns the leaf cluster it falls into, or -1 when
+    it falls outside every cluster.
+
+    The prediction is batched because approximate_predict materialises
+    intermediate arrays proportional to the batch, and a survey flattens to far
+    more points than fit in memory at once.
+
+    Args:
+        model (hdbscan.HDBSCAN): Clusterer fitted with ``prediction_data=True``.
+        X (np.ndarray): Feature matrix of shape (n_samples, n_features), in the
+            same feature space and scaling the model was fitted in.
+        batch_size (int): Rows predicted per call. Defaults to 200000.
+
+    Returns:
+        np.ndarray: Integer cluster labels of shape (n_samples,), -1 for points
+        that fall outside every cluster.
+
+    Raises:
+        ValueError: If the model carries no prediction data, which means it was
+            fitted without ``prediction_data=True``.
+    """
+    if getattr(model, "prediction_data_", None) is None:
+        raise ValueError(
+            "The fitted model carries no prediction data, so labels cannot be "
+            "projected onto unfitted points. Refit with prediction_data=True."
+        )
+
+    n_samples = len(X)
+    labels = np.empty(n_samples, dtype=int)
+    start_time = time.time()
+    for start in range(0, n_samples, batch_size):
+        stop = min(start + batch_size, n_samples)
+        batch_labels, _ = hdbscan.approximate_predict(model, X[start:stop])
+        labels[start:stop] = batch_labels
+        logger.debug("Predicted labels for rows %d:%d", start, stop)
+    logger.info(
+        "Predicted labels for %s points in %.2f seconds",
+        f"{n_samples:,}", time.time() - start_time
+    )
+    return labels
+
+
 def assign_noise_by_soft_membership(clusterer, threshold=0.1):
     """Assign noise points to clusters based on soft membership probabilities.
 

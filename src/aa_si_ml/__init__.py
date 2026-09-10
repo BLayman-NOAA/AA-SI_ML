@@ -25,6 +25,7 @@ from .ml import (
     extract_ml_data_flattened,
     extract_ml_data_gridded,
     extract_valid_samples_for_sklearn,
+    assign_clusters_by_prediction,
     embed_clustering_results,
     filter_normalized_by_cluster,
     full_dbscan_iteration,
@@ -44,6 +45,7 @@ from .ml_algorithms import (
     apply_kmeans_clustering,
     apply_min_cluster_size_filter,
     assign_noise_by_soft_membership,
+    predict_cluster_labels,
     retrieve_background_cluster,
 )
 
@@ -62,6 +64,7 @@ __all__ = [
     "apply_dbscan_clustering",
     "apply_kmeans_clustering",
     "apply_min_cluster_size_filter",
+    "assign_clusters_by_prediction",
     "assign_noise_by_soft_membership",
     "create_ml_index_coordinate",
     "data_preprocessing_pipeline",
@@ -84,6 +87,7 @@ __all__ = [
     "reshape_and_normalize_data",
     "reshape_data_for_ml",
     "retrieve_background_cluster",
+    "predict_cluster_labels",
     "run_hdbscan",
     "store_ml_data_flattened",
     "store_ml_results_flattened",

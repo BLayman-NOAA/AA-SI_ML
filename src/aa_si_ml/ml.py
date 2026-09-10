@@ -28,6 +28,7 @@ from .ml_algorithms import (
     apply_dbscan_clustering,
     apply_kmeans_clustering,
     apply_min_cluster_size_filter,
+    predict_cluster_labels,
     assign_noise_by_soft_membership,
     _calculate_silhouette,
     _resolve_min_cluster_size,
@@ -2213,6 +2214,155 @@ def run_hdbscan(
         'background_label': background_label,
         'cluster_labels': cluster_labels,
     }
+
+
+def assign_clusters_by_prediction(
+        ds_normalized,
+        clustering_results,
+        clustering_model,
+        dataset_name,
+        normalization_name,
+        ml_result_name=None,
+        batch_size=200000,
+        ):
+    """Extend a subsampled clustering to every point in the dataset.
+
+    :func:`run_hdbscan` clusters at most ``sample_size`` points, and the rest
+    receive no label at all, so they come back NaN once the result is regridded.
+    This projects the fitted structure onto the unlabelled points with
+    ``hdbscan.approximate_predict`` and returns a result covering every sample
+    index, which :func:`embed_clustering_results` then embeds as usual.
+
+    Points the fit did see keep their fitted label rather than a predicted one:
+    the fit is the more authoritative answer where it exists, and only the
+    remainder is being filled in. Predicted points that fall outside every
+    cluster get -1, the same noise label the fit uses.
+
+    The fitted model is required and cannot come from ``clustering_results``:
+    :func:`_clustering_result_to_dataset` drops the model when it converts a
+    result for checkpointing, recording only ``model_type`` and
+    ``model_available``. Wire ``clustering_model`` straight from the
+    ``run_hdbscan`` step that produced the result.
+
+    Args:
+        ds_normalized (xr.Dataset): Normalized ML dataset the clustering was run
+            against, supplying the full feature matrix.
+        clustering_results (xr.Dataset | dict): Result from run_hdbscan, holding
+            the fitted labels and the sample indices they belong to.
+        clustering_model (hdbscan.HDBSCAN): The fitted model from the same
+            run_hdbscan step, fitted with ``prediction_data=True``.
+        dataset_name (str): Base ML dataset name, matching reshape_for_ml.
+        normalization_name (str): Normalized feature set name, matching
+            normalize_ml_data.
+        ml_result_name (str or None): Name the extended result is stored under.
+            Defaults to the name already on *clustering_results*.
+        batch_size (int): Rows predicted per approximate_predict call.
+            Defaults to 200000.
+
+    Returns:
+        dict: With keys 'clustering_results' (an xr.Dataset covering every
+        sample index), 'clustering_model' (passed through unchanged), and
+        'cluster_labels' (sorted non-noise labels present in the result).
+
+    Raises:
+        ValueError: If *clustering_model* is None, or if the stored result
+            references sample indices the normalized dataset does not have.
+    """
+    if clustering_model is None:
+        raise ValueError(
+            "assign_clusters_by_prediction needs the fitted model, but "
+            "clustering_model is None. A checkpointed clustering_results "
+            "Dataset does not carry the model; wire clustering_model directly "
+            "from the run_hdbscan step."
+        )
+
+    result = dict(_coerce_clustering_result(clustering_results))
+    fitted_indices = np.asarray(result['sample_indices'])
+    fitted_labels = np.asarray(result['labels'])
+
+    X, _, all_indices = extract_valid_samples_for_sklearn(
+        ds_normalized,
+        normalization_name,
+        dataset_name=dataset_name,
+    )
+
+    n_missing = len(all_indices) - len(fitted_indices)
+    if n_missing <= 0:
+        logger.info(
+            "Clustering already covers all %s samples; nothing to predict",
+            f"{len(all_indices):,}"
+        )
+        labels = np.empty(len(all_indices), dtype=int)
+        positions = _positions_of(fitted_indices, all_indices)
+        labels[positions] = fitted_labels
+    else:
+        logger.info(
+            "Extending clustering from %s fitted to %s total samples "
+            "(%s to predict)",
+            f"{len(fitted_indices):,}", f"{len(all_indices):,}",
+            f"{n_missing:,}"
+        )
+        positions = _positions_of(fitted_indices, all_indices)
+        to_predict = np.ones(len(all_indices), dtype=bool)
+        to_predict[positions] = False
+
+        labels = np.empty(len(all_indices), dtype=int)
+        labels[positions] = fitted_labels
+        labels[to_predict] = predict_cluster_labels(
+            clustering_model, X[to_predict], batch_size=batch_size
+        )
+
+    n_noise = int(np.sum(labels < 0))
+    cluster_labels = sorted(int(lbl) for lbl in np.unique(labels) if lbl >= 0)
+    logger.info(
+        "Extended result: %d clusters, %s noise points (%.1f%%)",
+        len(cluster_labels), f"{n_noise:,}", 100 * n_noise / len(labels)
+    )
+
+    result.update({
+        'labels': labels,
+        'sample_indices': all_indices,
+        'n_clusters': len(cluster_labels),
+        'n_noise': n_noise,
+        'n_fitted': int(len(fitted_indices)),
+        'n_predicted': int(max(n_missing, 0)),
+        'label_source': 'fit + approximate_predict',
+    })
+    if ml_result_name is not None:
+        result['ml_result_name'] = ml_result_name
+    result.pop('model', None)
+
+    return {
+        'clustering_results': _clustering_result_to_dataset(result),
+        'clustering_model': clustering_model,
+        'cluster_labels': cluster_labels,
+    }
+
+
+def _positions_of(subset_indices, all_indices):
+    """Positions of *subset_indices* within the sorted *all_indices*.
+
+    Args:
+        subset_indices (np.ndarray): Sample indices to locate.
+        all_indices (np.ndarray): Ascending sample-index coordinate values.
+
+    Returns:
+        np.ndarray: Integer positions into *all_indices*.
+
+    Raises:
+        ValueError: If any subset index is absent from *all_indices*.
+    """
+    positions = np.searchsorted(all_indices, subset_indices)
+    out_of_range = positions >= len(all_indices)
+    positions[out_of_range] = 0
+    missing = out_of_range | (all_indices[positions] != subset_indices)
+    if np.any(missing):
+        raise ValueError(
+            "The clustering result references sample indices that are not in "
+            "the normalized dataset, so the two do not belong together: "
+            f"{np.asarray(subset_indices)[missing][:5]}..."
+        )
+    return positions
 
 
 def _embed_single_clustering_result(
