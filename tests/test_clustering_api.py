@@ -149,6 +149,93 @@ def test_run_hdbscan_accepts_min_cluster_size_fraction(monkeypatch):
     assert output['clustering_results'].attrs['min_cluster_size'] == 8
 
 
+def test_min_cluster_size_fraction_is_a_fraction_of_what_is_fitted(monkeypatch):
+    """The fraction follows sample_size, so it means one thing at any scale.
+
+    Taken of the full valid set instead, a capped fit would demand a cluster
+    inflated by the subsampling ratio: here 11 points out of the 50 the model
+    actually sees, from a number that reads as a tenth.
+    """
+    ds_normalized = _make_ds_normalized()
+    captured = {}
+
+    monkeypatch.setattr(
+        ml,
+        'extract_valid_samples_for_sklearn',
+        lambda *_args, **_kwargs: (
+            np.zeros((101, 2), dtype=float),
+            np.arange(101),
+            np.arange(101),
+        ),
+    )
+
+    def _capture_clustering(*_args, **kwargs):
+        captured['min_cluster_size'] = kwargs['min_cluster_size']
+        return {
+            'run_1': {
+                'labels': np.zeros(101, dtype=int),
+                'sample_indices': np.arange(101),
+                'model': 'model',
+                'method': 'hdbscan',
+                'min_cluster_size': kwargs['min_cluster_size'],
+            }
+        }
+
+    monkeypatch.setattr(ml, 'apply_dbscan_clustering', _capture_clustering)
+
+    ml.run_hdbscan(
+        ds_normalized,
+        dataset_name='ml_data_clean',
+        normalization_name='normalized_data',
+        ml_result_name='clusters',
+        min_cluster_size_fraction=0.1,
+        sample_size=50,
+    )
+
+    assert captured['min_cluster_size'] == 5
+
+
+def test_an_unbinding_sample_size_leaves_the_fraction_alone(monkeypatch):
+    """A cap above the data is a no-op, so the fraction is of everything."""
+    ds_normalized = _make_ds_normalized()
+    captured = {}
+
+    monkeypatch.setattr(
+        ml,
+        'extract_valid_samples_for_sklearn',
+        lambda *_args, **_kwargs: (
+            np.zeros((101, 2), dtype=float),
+            np.arange(101),
+            np.arange(101),
+        ),
+    )
+
+    def _capture_clustering(*_args, **kwargs):
+        captured['min_cluster_size'] = kwargs['min_cluster_size']
+        return {
+            'run_1': {
+                'labels': np.zeros(101, dtype=int),
+                'sample_indices': np.arange(101),
+                'model': 'model',
+                'method': 'hdbscan',
+                'min_cluster_size': kwargs['min_cluster_size'],
+            }
+        }
+
+    monkeypatch.setattr(ml, 'apply_dbscan_clustering', _capture_clustering)
+
+    ml.run_hdbscan(
+        ds_normalized,
+        dataset_name='ml_data_clean',
+        normalization_name='normalized_data',
+        ml_result_name='clusters',
+        min_cluster_size_fraction=0.1,
+        sample_size=100000,
+    )
+
+    assert captured['min_cluster_size'] == 11
+
+
 def test_run_hdbscan_rejects_min_cluster_size_and_fraction(monkeypatch):
     ds_normalized = _make_ds_normalized()
 

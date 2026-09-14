@@ -16,6 +16,25 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MIN_CLUSTER_SIZE_FRACTION = 0.03
 
 
+def fitted_sample_size(n_points, sample_size):
+    """Return how many of *n_points* a fit capped at *sample_size* will see.
+
+    The counterpart of :func:`_subsample_data` for callers that need the size
+    before the subsample exists, so that a fraction of "the data the model saw"
+    can be resolved without taking the sample twice.
+
+    Args:
+        n_points (int): Points available to fit.
+        sample_size (int or None): Cap on the fit. None means no cap.
+
+    Returns:
+        int: The smaller of the two, and *n_points* when there is no cap.
+    """
+    if sample_size is not None and sample_size < n_points:
+        return sample_size
+    return n_points
+
+
 def _subsample_data(X, sample_indices, sample_size, algorithm_name):
     """Return a random subsample of X and sample_indices, or the originals.
 
@@ -29,7 +48,7 @@ def _subsample_data(X, sample_indices, sample_size, algorithm_name):
     Returns:
         tuple: (X_out, indices_out) arrays of the (possibly subsampled) data.
     """
-    if sample_size is not None and sample_size < len(X):
+    if fitted_sample_size(len(X), sample_size) < len(X):
         logger.info(
             "Using random sample of %s points for %s (from %s total)",
             f"{sample_size:,}", algorithm_name, f"{len(X):,}"
@@ -85,10 +104,17 @@ def apply_dbscan_clustering(
         min_cluster_size (int or None): Absolute minimum cluster size
             (HDBSCAN parameter / DBSCAN post-filter). Mutually exclusive
             with min_cluster_size_fraction. Defaults to None.
-        min_cluster_size_fraction (float or None): Fraction of input data
-            points used to derive min_cluster_size when an absolute
+        min_cluster_size_fraction (float or None): Fraction of the points
+            actually fitted used to derive min_cluster_size when an absolute
             size is not provided. When None, defaults to 0.03. Defaults
             to None.
+
+            The fraction is taken of the subsample, not of X_normalized, so
+            it means the same thing whether or not sample_size binds: a
+            cluster must hold this share of what the model saw. Taking it of
+            the full set instead would inflate the effective minimum by the
+            subsampling ratio, silently demanding a larger cluster than the
+            number asks for.
         cluster_selection_method (str): HDBSCAN cluster selection method.
             Defaults to 'eom'.
         soft_membership_threshold (float or None): If set, reassign
@@ -106,7 +132,7 @@ def apply_dbscan_clustering(
     )
     min_cluster_size = _resolve_min_cluster_size(
         min_cluster_size,
-        len(X_normalized),
+        len(X_sample),
         min_cluster_size_fraction=min_cluster_size_fraction,
     )
 
@@ -134,7 +160,19 @@ def _resolve_min_cluster_size(
         n_data_points,
         min_cluster_size_fraction=None,
         ):
-    """Return the absolute cluster size, deriving it from a fraction if needed."""
+    """Return the absolute cluster size, deriving it from a fraction if needed.
+
+    Args:
+        min_cluster_size (int or None): An absolute size, returned unchanged.
+        n_data_points (int): Points the fraction is taken of. Callers pass the
+            number of points the model is fitted on, not the size of the pool
+            they were drawn from.
+        min_cluster_size_fraction (float or None): Share of *n_data_points* a
+            cluster must hold. Defaults to None, meaning 0.03.
+
+    Returns:
+        int: The minimum cluster size, never below 2.
+    """
     if min_cluster_size is not None and min_cluster_size_fraction is not None:
         raise ValueError(
             "Provide either min_cluster_size or min_cluster_size_fraction, not both."

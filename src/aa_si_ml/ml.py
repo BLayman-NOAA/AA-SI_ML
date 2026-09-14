@@ -32,6 +32,7 @@ from .ml_algorithms import (
     assign_noise_by_soft_membership,
     _calculate_silhouette,
     _resolve_min_cluster_size,
+    fitted_sample_size,
     retrieve_background_cluster,
 )
 from .plotting_and_logging import (
@@ -2160,9 +2161,12 @@ def run_hdbscan(
         normalization_name,
         dataset_name=dataset_name,
     )
+    # Resolved against the points the model will actually be fitted on, not
+    # the pool they are drawn from. This step hands an absolute size down, so
+    # it is the only place the fraction is interpreted on this path.
     min_cluster_size = _resolve_min_cluster_size(
         min_cluster_size,
-        len(X),
+        fitted_sample_size(len(X), sample_size),
         min_cluster_size_fraction=min_cluster_size_fraction,
     )
 
@@ -2659,9 +2663,10 @@ def extract_data_and_run_hdbscan(
         sample_size (int): Sub-sample size. Defaults to 1_000_000.
         min_cluster_size (int or None): Absolute minimum cluster size.
             Mutually exclusive with min_cluster_size_fraction. Defaults to None.
-        min_cluster_size_fraction (float or None): Fraction of data points
-            used to derive min_cluster_size when an absolute size is not
-            provided. When None, defaults to 0.03. Defaults to None.
+        min_cluster_size_fraction (float or None): Fraction of the points
+            actually fitted, after any sample_size cap, used to derive
+            min_cluster_size when an absolute size is not provided. When
+            None, defaults to 0.03. Defaults to None.
         cluster_selection_method (str): HDBSCAN cluster-selection
             method. Defaults to 'leaf'.
         use_hdbscan (bool): Use HDBSCAN instead of DBSCAN.
@@ -2803,9 +2808,10 @@ def full_dbscan_iteration(
         sample_size (int): Sub-sample size. Defaults to 1_000_000.
         min_cluster_size (int or None): Absolute minimum cluster size.
             Mutually exclusive with min_cluster_size_fraction. Defaults to None.
-        min_cluster_size_fraction (float or None): Fraction of data points
-            used to derive min_cluster_size when an absolute size is not
-            provided. When None, defaults to 0.03. Defaults to None.
+        min_cluster_size_fraction (float or None): Fraction of the points
+            actually fitted, after any sample_size cap, used to derive
+            min_cluster_size when an absolute size is not provided. When
+            None, defaults to 0.03. Defaults to None.
         cluster_selection_method (str): HDBSCAN method.
             Defaults to 'leaf'.
         use_hdbscan (bool): Use HDBSCAN. Defaults to True.
