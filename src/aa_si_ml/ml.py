@@ -483,6 +483,7 @@ def compute_per_cell_statistics(
         statistics=None,
         data_var='Sv',
         range_var='echo_range',
+        range_var_max=None,
         ):
     """Compute per-MVBS-cell statistics from fine-resolution Sv data.
 
@@ -520,6 +521,15 @@ def compute_per_cell_statistics(
             the transducer face, ``'depth'`` from the surface and requires the
             dataset to carry a depth variable.  Defaults to ``'echo_range'``.
             The cell dimension names do not change with it.
+        range_var_max (str or None): Deepest value the cells cover, as a unit
+            string (e.g. ``"1810m"``), matching the downstream ``compute_MVBS``
+            call.  When None the extent is read from the data, which forces a
+            compute on a lazy dataset AND lets each dataset choose its own cell
+            grid length.  That is fine for one merged dataset and wrong for a
+            fan-out: per-file results binned to their own extents concatenate by
+            outer-joining ``cell_echo_range`` and NaN-padding the short ones.
+            Pin it to the same value ``compute_MVBS`` is pinned to whenever the
+            results will be merged.
 
     Returns:
         xr.Dataset: Copy of *ds_Sv* with one new DataArray per statistic
@@ -549,7 +559,10 @@ def compute_per_cell_statistics(
 
     # Build the same interval grids that compute_MVBS uses.
     range_bin_val = float(range_bin.rstrip('m'))
-    range_max = float(ds_Sv[range_var].max(skipna=True).values)
+    if range_var_max is not None:
+        range_max = float(str(range_var_max).rstrip('m'))
+    else:
+        range_max = float(ds_Sv[range_var].max(skipna=True).values)
     range_edges = np.arange(0, range_max + range_bin_val, range_bin_val)
     range_interval = pd.IntervalIndex.from_breaks(range_edges, closed='left').sort_values()
 
