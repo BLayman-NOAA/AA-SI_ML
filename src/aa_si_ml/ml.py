@@ -484,6 +484,7 @@ def compute_per_cell_statistics(
         data_var='Sv',
         range_var='echo_range',
         range_var_max=None,
+        cells_only=False,
         ):
     """Compute per-MVBS-cell statistics from fine-resolution Sv data.
 
@@ -530,6 +531,14 @@ def compute_per_cell_statistics(
             outer-joining ``cell_echo_range`` and NaN-padding the short ones.
             Pin it to the same value ``compute_MVBS`` is pinned to whenever the
             results will be merged.
+        cells_only (bool): Return only the statistic DataArrays instead of a
+            copy of *ds_Sv* carrying them.  The default keeps the source
+            variables, which is what a single-dataset call wants.  Set it when
+            the results are checkpointed or merged: the fine-resolution Sv would
+            otherwise be written a second time, and concatenating on
+            ``cell_ping_time`` would drag ``ping_time`` and ``range_sample``
+            into the join, which across files with differing range_sample
+            lengths outer-joins and NaN-pads them.
 
     Returns:
         xr.Dataset: Copy of *ds_Sv* with one new DataArray per statistic
@@ -636,6 +645,12 @@ def compute_per_cell_statistics(
         logger.info(
             "Computed '%s' with shape %s (channel, cell_ping_time, cell_echo_range).",
             var_name, da.shape,
+        )
+
+    if cells_only:
+        ds_out = xr.Dataset(
+            {name: ds_out[name] for name in stat_name_map.values()
+             if name in ds_out}
         )
 
     ds_out.attrs['cell_statistics'] = list(statistics)

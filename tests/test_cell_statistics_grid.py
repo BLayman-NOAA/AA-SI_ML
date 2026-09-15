@@ -98,3 +98,55 @@ def test_a_unit_string_without_the_suffix_is_accepted():
         _ds_sv(100.0), range_bin="2m", range_var_max="400"
     )
     assert _cells(pinned) == 200
+
+
+# ---------------------------------------------------------------------------
+# cells_only: what the result carries
+# ---------------------------------------------------------------------------
+#
+# The step returns a copy of its input with the statistic added, which is right
+# for a single call on a merged dataset and wrong for a checkpointed per-file
+# fan-out: the fine-resolution Sv gets written a second time, and a merge on
+# cell_ping_time drags ping_time and range_sample into the join.
+
+
+def test_default_keeps_the_source_variables():
+    out = compute_per_cell_statistics(_ds_sv(100.0), range_bin="2m")
+
+    assert "Sv" in out.data_vars
+    assert "range_sample" in out.sizes
+
+
+def test_cells_only_returns_just_the_statistics():
+    out = compute_per_cell_statistics(
+        _ds_sv(100.0), range_bin="2m", cells_only=True
+    )
+
+    assert list(out.data_vars) == ["cell_cv"]
+    assert "range_sample" not in out.sizes
+    assert "ping_time" not in out.sizes
+    assert set(out["cell_cv"].dims) == {"channel", "cell_ping_time", "cell_echo_range"}
+
+
+def test_cells_only_leaves_the_statistic_untouched():
+    ds = _ds_sv(100.0)
+    full = compute_per_cell_statistics(ds, range_bin="2m")
+    cells = compute_per_cell_statistics(ds, range_bin="2m", cells_only=True)
+
+    np.testing.assert_allclose(
+        cells["cell_cv"].values, full["cell_cv"].values, equal_nan=True
+    )
+
+
+def test_cells_only_results_merge_across_files_with_different_depths():
+    """The failure this exists to prevent: ragged range_sample entering the join."""
+    parts = []
+    for depth, n_range in ((100.0, 20), (400.0, 80)):
+        ds = _ds_sv(depth, n_range=n_range)
+        parts.append(compute_per_cell_statistics(
+            ds, range_bin="2m", range_var_max="400m", cells_only=True))
+
+    merged = xr.concat(parts, dim="cell_ping_time", join="exact")
+
+    assert merged.sizes["cell_echo_range"] == 200
+    assert "range_sample" not in merged.sizes
