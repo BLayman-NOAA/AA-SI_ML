@@ -2168,6 +2168,59 @@ def _build_overlay_lines(overlay_line_var):
     ]
 
 
+DEFAULT_OVERLAY_WINDOW_KEYS = ("dive_fit_evl", "dive_u99_evl", "dive_l99_evl")
+OVERLAY_WINDOW_COLOR = "#23FFFF"
+
+
+def _overlay_window_style(key):
+    linewidth = 3.0 if key == "dive_fit_evl" else 1.5
+    return {'color': OVERLAY_WINDOW_COLOR, 'linewidth': linewidth}
+
+
+def _attach_window_overlays(ds, windows, keys):
+    """Read each window's line files onto its own slice of *ds*.
+
+    One variable is added per window and key, NaN outside that window, so
+    every dive draws as its own segment and two dives that overlap in time
+    each keep their own depth. Returns the widened dataset and the overlay
+    specs that draw the new variables.
+
+    Args:
+        ds (xr.Dataset): Dataset with a ``ping_time`` coordinate.
+        windows (list[dict]): Windows with ``start``, ``end``, ``label`` and
+            line paths under *keys*.
+        keys (list[str]): Window keys naming the line files to draw. A window
+            without a key is skipped for that key.
+
+    Returns:
+        tuple[xr.Dataset, list[dict]]: The dataset and overlay line specs.
+    """
+    if not windows:
+        return ds, []
+
+    overlays = []
+    new_vars = {}
+    for index, window in enumerate(windows):
+        label = window.get("label", f"window_{index}")
+        subset = ds.sel(ping_time=slice(window.get("start"), window.get("end")))
+        if subset.sizes.get("ping_time", 0) == 0:
+            logger.warning("%s: no pings in the dataset for this window; no overlay drawn", label)
+            continue
+        for key in keys:
+            if not window.get(key):
+                continue
+            var_name = f"overlay_{key}_{label}"
+            with_line = utils.add_line_overlay(
+                subset, window=window, window_key=key, line_name=var_name
+            )
+            new_vars[var_name] = with_line[var_name].reindex(ping_time=ds["ping_time"])
+            overlays.append({'var': var_name, 'style': _overlay_window_style(key)})
+
+    if not new_vars:
+        return ds, []
+    return ds.assign(new_vars), overlays
+
+
 def run_hdbscan(
     ds_normalized,
     dataset_name,
@@ -2439,6 +2492,8 @@ def _plot_single_clustering_result(
         x_axis_units="datetime",
         y_axis_units="meters",
         overlay_line_var=None,
+        overlay_windows=None,
+        overlay_window_keys=None,
         cluster_colors=None,
         y_to_x_aspect_ratio_override=None,
         cluster_stats_sv_data_var="Sv",
@@ -2456,9 +2511,15 @@ def _plot_single_clustering_result(
     resolved_cluster_colors = cluster_colors or DEFAULT_CLUSTER_COLORS
 
     overlay_lines = _build_overlay_lines(overlay_line_var)
+    ds_echogram, window_overlays = _attach_window_overlays(
+        ds_normalized,
+        overlay_windows,
+        overlay_window_keys or list(DEFAULT_OVERLAY_WINDOW_KEYS),
+    )
+    overlay_lines = overlay_lines + window_overlays
 
     echogram.plot_cluster_echogram(
-        ds_normalized,
+        ds_echogram,
         dataset_name=dataset_name,
         specific_data_name=ml_result_name,
         min_depth=resolved_plot_window[0],
@@ -2561,6 +2622,8 @@ def plot_clustering_report(
         x_axis_units="datetime",
         y_axis_units="meters",
         overlay_line_var=None,
+        overlay_windows=None,
+        overlay_window_keys=None,
         cluster_colors=None,
         y_to_x_aspect_ratio_override=None,
         cluster_stats_sv_data_var="Sv",
@@ -2587,6 +2650,11 @@ def plot_clustering_report(
     ``time_min`` and ``time_max`` window the echogram by UTC timestamp,
     taking precedence over the ping bounds in ``plot_window``. Pair them with
     ``x_axis_units='datetime'`` to label the axis with clock times.
+
+    ``overlay_windows`` draws line files onto the echogram per window: each
+    window's files under ``overlay_window_keys`` (the three dive-profile keys
+    by default) are read onto that window's own pings, so every window is a
+    separate segment and overlapping windows each keep their own line.
     """
     if isinstance(clustering_results, list):
         for index, clustering_result in enumerate(clustering_results, start=1):
@@ -2603,6 +2671,8 @@ def plot_clustering_report(
                 x_axis_units=x_axis_units,
                 y_axis_units=y_axis_units,
                 overlay_line_var=overlay_line_var,
+                overlay_windows=overlay_windows,
+                overlay_window_keys=overlay_window_keys,
                 cluster_colors=cluster_colors,
                 y_to_x_aspect_ratio_override=y_to_x_aspect_ratio_override,
                 cluster_stats_sv_data_var=cluster_stats_sv_data_var,
@@ -2631,6 +2701,8 @@ def plot_clustering_report(
         x_axis_units=x_axis_units,
         y_axis_units=y_axis_units,
         overlay_line_var=overlay_line_var,
+        overlay_windows=overlay_windows,
+        overlay_window_keys=overlay_window_keys,
         cluster_colors=cluster_colors,
         y_to_x_aspect_ratio_override=y_to_x_aspect_ratio_override,
         cluster_stats_sv_data_var=cluster_stats_sv_data_var,
