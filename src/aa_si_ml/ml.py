@@ -2169,12 +2169,14 @@ def _build_overlay_lines(overlay_line_var):
 
 
 DEFAULT_OVERLAY_WINDOW_KEYS = ("dive_fit_evl", "dive_u99_evl", "dive_l99_evl")
-OVERLAY_WINDOW_COLOR = "#23FFFF"
+OVERLAY_FIT_STYLE = {'color': "#23FFFF", 'linewidth': 3.0}
+OVERLAY_BOUND_STYLE = {'color': "#D08BFF", 'linewidth': 1.8, 'linestyle': ':'}
 
 
 def _overlay_window_style(key):
-    linewidth = 3.0 if key == "dive_fit_evl" else 1.5
-    return {'color': OVERLAY_WINDOW_COLOR, 'linewidth': linewidth}
+    """Solid cyan for the fitted profile, dotted violet for its bounds."""
+    style = OVERLAY_FIT_STYLE if key == "dive_fit_evl" else OVERLAY_BOUND_STYLE
+    return dict(style)
 
 
 def _attach_window_overlays(ds, windows, keys):
@@ -2309,6 +2311,7 @@ def assign_clusters_by_prediction(
         normalization_name,
         ml_result_name=None,
         batch_size=200000,
+        keep_model=True,
         ):
     """Extend a subsampled clustering to every point in the dataset.
 
@@ -2329,6 +2332,11 @@ def assign_clusters_by_prediction(
     ``model_available``. Wire ``clustering_model`` straight from the
     ``run_hdbscan`` step that produced the result.
 
+    ``keep_model=False`` returns None on the ``clustering_model`` port. The
+    model only serves the hierarchy plot downstream, and a checkpoint of this
+    step would otherwise have to pickle it; with the port empty every output
+    checkpoints as Zarr or JSON.
+
     Args:
         ds_normalized (xr.Dataset): Normalized ML dataset the clustering was run
             against, supplying the full feature matrix.
@@ -2343,6 +2351,8 @@ def assign_clusters_by_prediction(
             Defaults to the name already on *clustering_results*.
         batch_size (int): Rows predicted per approximate_predict call.
             Defaults to 200000.
+        keep_model (bool): Pass the model through on ``clustering_model``.
+            False returns None there so the step checkpoints without pickle.
 
     Returns:
         dict: With keys 'clustering_results' (an xr.Dataset covering every
@@ -2419,7 +2429,7 @@ def assign_clusters_by_prediction(
 
     return {
         'clustering_results': _clustering_result_to_dataset(result),
-        'clustering_model': clustering_model,
+        'clustering_model': clustering_model if keep_model else None,
         'cluster_labels': cluster_labels,
     }
 
@@ -2613,9 +2623,9 @@ def embed_clustering_results(
 
 def plot_clustering_report(
         ds_normalized,
-        clustering_results,
-        dataset_name,
-        ml_result_name,
+        clustering_results=None,
+        dataset_name=None,
+        ml_result_name=None,
         clustering_model=None,
         ds_Sv=None,
         plot_window=None,
@@ -2624,6 +2634,7 @@ def plot_clustering_report(
         overlay_line_var=None,
         overlay_windows=None,
         overlay_window_keys=None,
+        normalization_name=None,
         cluster_colors=None,
         y_to_x_aspect_ratio_override=None,
         cluster_stats_sv_data_var="Sv",
@@ -2655,7 +2666,24 @@ def plot_clustering_report(
     window's files under ``overlay_window_keys`` (the three dive-profile keys
     by default) are read onto that window's own pings, so every window is a
     separate segment and overlapping windows each keep their own line.
+
+    ``clustering_results`` is optional. Every panel but the hierarchy plot
+    reads the labels from ``ds_normalized``, where
+    :func:`embed_clustering_results` stored them under ``ml_result_name``, so
+    a report can be drawn from that checkpointed dataset alone. Without a
+    result the hierarchy panel is skipped, and ``normalization_name`` supplies
+    what ``cluster_stats_sv_data_var='ml_features'`` would otherwise read from
+    the result.
     """
+    if dataset_name is None or ml_result_name is None:
+        raise ValueError("dataset_name and ml_result_name are required")
+    if clustering_results is None:
+        clustering_results = {
+            'ml_result_name': ml_result_name,
+            'normalization_name': normalization_name,
+            'model': None,
+            'plot_hierarchy': False,
+        }
     if isinstance(clustering_results, list):
         for index, clustering_result in enumerate(clustering_results, start=1):
             clustering_result = _coerce_clustering_result(clustering_result)

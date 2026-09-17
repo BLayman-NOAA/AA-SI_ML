@@ -272,3 +272,33 @@ def test_predict_without_prediction_data_raises():
 
     with pytest.raises(ValueError, match="prediction_data=True"):
         ml_algorithms.predict_cluster_labels(model, X)
+
+
+def test_keep_model_false_leaves_the_model_port_empty(monkeypatch):
+    X = np.arange(12, dtype=float).reshape(6, 2)
+    _patch_extract(monkeypatch, X, [10, 11, 12, 13, 14, 15])
+    _patch_predict(monkeypatch, [1, 1, -1, 0])
+    model = _StubModel(None)
+
+    kept = ml.assign_clusters_by_prediction(
+        _ds_normalized(),
+        _fitted_result([0, 1], [11, 14]),
+        clustering_model=model,
+        dataset_name='ml_data_clean',
+        normalization_name='normalized_data',
+    )
+    dropped = ml.assign_clusters_by_prediction(
+        _ds_normalized(),
+        _fitted_result([0, 1], [11, 14]),
+        clustering_model=model,
+        dataset_name='ml_data_clean',
+        normalization_name='normalized_data',
+        keep_model=False,
+    )
+
+    assert kept['clustering_model'] is model
+    assert dropped['clustering_model'] is None
+    np.testing.assert_array_equal(
+        dropped['clustering_results']['labels'].values,
+        kept['clustering_results']['labels'].values,
+    )

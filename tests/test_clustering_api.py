@@ -3,6 +3,7 @@
 """Focused tests for the recipe-facing clustering API."""
 
 import numpy as np
+import pytest
 import xarray as xr
 
 from aa_si_ml import ml, ml_algorithms
@@ -608,3 +609,42 @@ def test_assign_noise_by_soft_membership_reassigns_confident_noise(monkeypatch):
     labels = ml_algorithms.assign_noise_by_soft_membership(clusterer, threshold=0.5)
 
     np.testing.assert_array_equal(labels, np.array([0, 1, -1]))
+
+
+def test_plot_clustering_report_draws_from_the_embedded_dataset_alone(monkeypatch):
+    """No clustering result wired: echogram and stats render, hierarchy is skipped."""
+    ds_normalized = _make_ds_normalized()
+    seen = {'echogram': 0, 'stats': [], 'hierarchy': 0}
+
+    monkeypatch.setattr(
+        ml.echogram,
+        'plot_cluster_echogram',
+        lambda *args, **kwargs: seen.__setitem__('echogram', seen['echogram'] + 1),
+    )
+    monkeypatch.setattr(
+        ml,
+        'plot_cluster_statistics',
+        lambda *args, **kwargs: seen['stats'].append(kwargs),
+    )
+    monkeypatch.setattr(
+        ml,
+        'plot_dbscan_cluster_hierarchy',
+        lambda *args, **kwargs: seen.__setitem__('hierarchy', seen['hierarchy'] + 1),
+    )
+
+    ml.plot_clustering_report(
+        ds_normalized,
+        dataset_name='ml_data_clean',
+        ml_result_name='clusters',
+        cluster_stats_sv_data_var='ml_features',
+        normalization_name='normalized_data',
+    )
+
+    assert seen['echogram'] == 1
+    assert seen['hierarchy'] == 0
+    assert [call['normalize_data_name'] for call in seen['stats']] == ['normalized_data']
+
+
+def test_plot_clustering_report_requires_the_result_names():
+    with pytest.raises(ValueError, match="dataset_name and ml_result_name"):
+        ml.plot_clustering_report(_make_ds_normalized(), ml_result_name='clusters')

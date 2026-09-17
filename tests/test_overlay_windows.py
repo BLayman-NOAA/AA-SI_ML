@@ -129,3 +129,21 @@ def test_report_passes_window_overlays_to_the_echogram(tmp_path, monkeypatch):
     assert [o["var"] for o in seen["overlay_lines"]] == ["overlay_dive_fit_evl_A"]
     assert "overlay_dive_fit_evl_A" in seen["ds"]
     assert "overlay_dive_fit_evl_A" not in ds
+
+
+def test_bounds_are_dotted_and_a_different_color_from_the_fit(tmp_path):
+    ds = _dataset()
+    fit = _write_evl(tmp_path, "fit.evl", [("0000000000", 40.0), ("0000020000", 60.0)])
+    upper = _write_evl(tmp_path, "u.evl", [("0000000000", 30.0), ("0000020000", 50.0)])
+    lower = _write_evl(tmp_path, "l.evl", [("0000000000", 50.0), ("0000020000", 70.0)])
+    windows = [_window("A", 0, 2, dive_fit_evl=fit, dive_u99_evl=upper, dive_l99_evl=lower)]
+
+    _, overlays = ml._attach_window_overlays(
+        ds, windows, ["dive_fit_evl", "dive_u99_evl", "dive_l99_evl"]
+    )
+
+    fit_style, upper_style, lower_style = (o["style"] for o in overlays)
+    assert "linestyle" not in fit_style
+    assert upper_style["linestyle"] == ":" and lower_style["linestyle"] == ":"
+    assert upper_style["color"] == lower_style["color"] != fit_style["color"]
+    assert upper_style is not lower_style
