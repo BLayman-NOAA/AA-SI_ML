@@ -147,3 +147,59 @@ def test_bounds_are_dotted_and_a_different_color_from_the_fit(tmp_path):
     assert upper_style["linestyle"] == ":" and lower_style["linestyle"] == ":"
     assert upper_style["color"] == lower_style["color"] != fit_style["color"]
     assert upper_style is not lower_style
+
+
+def test_recipe_styles_merge_over_the_defaults(tmp_path):
+    ds = _dataset()
+    fit = _write_evl(tmp_path, "fit.evl", [("0000000000", 40.0), ("0000020000", 60.0)])
+    upper = _write_evl(tmp_path, "u.evl", [("0000000000", 30.0), ("0000020000", 50.0)])
+    windows = [_window("A", 0, 2, dive_fit_evl=fit, dive_u99_evl=upper)]
+
+    _, overlays = ml._attach_window_overlays(
+        ds,
+        windows,
+        ["dive_fit_evl", "dive_u99_evl"],
+        fit_style={"color": "white"},
+        bound_style={"color": "orange", "linestyle": "--"},
+    )
+
+    fit_style, bound_style = (o["style"] for o in overlays)
+    assert fit_style["color"] == "white"
+    # Width came from the default, because the override named only a colour.
+    assert fit_style["linewidth"] == ml.OVERLAY_FIT_STYLE["linewidth"]
+    assert bound_style["color"] == "orange"
+    assert bound_style["linestyle"] == "--"
+
+
+def test_styles_are_not_shared_or_mutated_between_lines(tmp_path):
+    """The drawing layer fills defaults into the dict it is handed."""
+    ds = _dataset()
+    fit = _write_evl(tmp_path, "fit.evl", [("0000000000", 40.0), ("0000020000", 60.0)])
+    upper = _write_evl(tmp_path, "u.evl", [("0000000000", 30.0), ("0000020000", 50.0)])
+    lower = _write_evl(tmp_path, "l.evl", [("0000000000", 50.0), ("0000020000", 70.0)])
+    windows = [_window("A", 0, 2, dive_fit_evl=fit, dive_u99_evl=upper, dive_l99_evl=lower)]
+    override = {"color": "orange"}
+
+    _, overlays = ml._attach_window_overlays(
+        ds, windows, ["dive_fit_evl", "dive_u99_evl", "dive_l99_evl"],
+        bound_style=override,
+    )
+
+    styles = [o["style"] for o in overlays]
+    assert styles[1] is not styles[2]
+    styles[1]["alpha"] = 0.5
+    assert "alpha" not in styles[2]
+    assert override == {"color": "orange"}
+    assert ml.OVERLAY_BOUND_STYLE["color"] == "#D08BFF"
+
+
+def test_empty_style_dicts_fall_back_to_the_defaults(tmp_path):
+    ds = _dataset()
+    fit = _write_evl(tmp_path, "fit.evl", [("0000000000", 40.0), ("0000020000", 60.0)])
+    windows = [_window("A", 0, 2, dive_fit_evl=fit)]
+
+    _, overlays = ml._attach_window_overlays(
+        ds, windows, ["dive_fit_evl"], fit_style={}, bound_style={}
+    )
+
+    assert overlays[0]["style"] == ml.OVERLAY_FIT_STYLE

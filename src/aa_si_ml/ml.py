@@ -2173,13 +2173,33 @@ OVERLAY_FIT_STYLE = {'color': "#23FFFF", 'linewidth': 3.0}
 OVERLAY_BOUND_STYLE = {'color': "#D08BFF", 'linewidth': 1.8, 'linestyle': ':'}
 
 
-def _overlay_window_style(key):
-    """Solid cyan for the fitted profile, dotted violet for its bounds."""
-    style = OVERLAY_FIT_STYLE if key == "dive_fit_evl" else OVERLAY_BOUND_STYLE
-    return dict(style)
+def _overlay_window_style(key, fit_style=None, bound_style=None):
+    """Matplotlib keywords for one overlay line.
+
+    Solid cyan for the fitted profile, dotted violet for its bounds. An
+    override is merged over those defaults rather than replacing them, so a
+    recipe naming only ``color`` keeps the width and dash pattern.
+
+    Args:
+        key (str): Window key the line came from. ``"dive_fit_evl"`` is the
+            fitted profile; anything else is treated as a bound.
+        fit_style (dict | None): Overrides for the fitted profile.
+        bound_style (dict | None): Overrides for the confidence bounds.
+
+    Returns:
+        dict: A fresh dict, since the drawing layer fills in defaults on it.
+    """
+    if key == "dive_fit_evl":
+        base, override = OVERLAY_FIT_STYLE, fit_style
+    else:
+        base, override = OVERLAY_BOUND_STYLE, bound_style
+    style = dict(base)
+    if override:
+        style.update(override)
+    return style
 
 
-def _attach_window_overlays(ds, windows, keys):
+def _attach_window_overlays(ds, windows, keys, fit_style=None, bound_style=None):
     """Read each window's line files onto its own slice of *ds*.
 
     One variable is added per window and key, NaN outside that window, so
@@ -2193,6 +2213,9 @@ def _attach_window_overlays(ds, windows, keys):
             line paths under *keys*.
         keys (list[str]): Window keys naming the line files to draw. A window
             without a key is skipped for that key.
+        fit_style (dict | None): Matplotlib keyword overrides for the fitted
+            profile line, merged over the defaults.
+        bound_style (dict | None): The same for the two confidence bounds.
 
     Returns:
         tuple[xr.Dataset, list[dict]]: The dataset and overlay line specs.
@@ -2216,7 +2239,12 @@ def _attach_window_overlays(ds, windows, keys):
                 subset, window=window, window_key=key, line_name=var_name
             )
             new_vars[var_name] = with_line[var_name].reindex(ping_time=ds["ping_time"])
-            overlays.append({'var': var_name, 'style': _overlay_window_style(key)})
+            overlays.append({
+                'var': var_name,
+                'style': _overlay_window_style(
+                    key, fit_style=fit_style, bound_style=bound_style
+                ),
+            })
 
     if not new_vars:
         return ds, []
@@ -2504,6 +2532,8 @@ def _plot_single_clustering_result(
         overlay_line_var=None,
         overlay_windows=None,
         overlay_window_keys=None,
+        overlay_fit_style=None,
+        overlay_bound_style=None,
         cluster_colors=None,
         y_to_x_aspect_ratio_override=None,
         cluster_stats_sv_data_var="Sv",
@@ -2525,6 +2555,8 @@ def _plot_single_clustering_result(
         ds_normalized,
         overlay_windows,
         overlay_window_keys or list(DEFAULT_OVERLAY_WINDOW_KEYS),
+        fit_style=overlay_fit_style,
+        bound_style=overlay_bound_style,
     )
     overlay_lines = overlay_lines + window_overlays
 
@@ -2634,6 +2666,8 @@ def plot_clustering_report(
         overlay_line_var=None,
         overlay_windows=None,
         overlay_window_keys=None,
+        overlay_fit_style=None,
+        overlay_bound_style=None,
         normalization_name=None,
         cluster_colors=None,
         y_to_x_aspect_ratio_override=None,
@@ -2666,6 +2700,11 @@ def plot_clustering_report(
     window's files under ``overlay_window_keys`` (the three dive-profile keys
     by default) are read onto that window's own pings, so every window is a
     separate segment and overlapping windows each keep their own line.
+
+    ``overlay_fit_style`` and ``overlay_bound_style`` are matplotlib keyword
+    dicts for the fitted profile and for its two confidence bounds. Each is
+    merged over the built-in style, so naming only ``color`` restyles the
+    colour and leaves the width and dash pattern alone.
 
     ``clustering_results`` is optional. Every panel but the hierarchy plot
     reads the labels from ``ds_normalized``, where
@@ -2701,6 +2740,8 @@ def plot_clustering_report(
                 overlay_line_var=overlay_line_var,
                 overlay_windows=overlay_windows,
                 overlay_window_keys=overlay_window_keys,
+                overlay_fit_style=overlay_fit_style,
+                overlay_bound_style=overlay_bound_style,
                 cluster_colors=cluster_colors,
                 y_to_x_aspect_ratio_override=y_to_x_aspect_ratio_override,
                 cluster_stats_sv_data_var=cluster_stats_sv_data_var,
@@ -2731,6 +2772,8 @@ def plot_clustering_report(
         overlay_line_var=overlay_line_var,
         overlay_windows=overlay_windows,
         overlay_window_keys=overlay_window_keys,
+        overlay_fit_style=overlay_fit_style,
+        overlay_bound_style=overlay_bound_style,
         cluster_colors=cluster_colors,
         y_to_x_aspect_ratio_override=y_to_x_aspect_ratio_override,
         cluster_stats_sv_data_var=cluster_stats_sv_data_var,
