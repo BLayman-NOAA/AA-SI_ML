@@ -1151,8 +1151,7 @@ def _build_scaler(method, X, n_quantiles=100, flatten_weight=1):
     X_out = scaler.fit_transform(X)
 
     if method in ('flatten', 'flatten_plus_umap'):
-        X_flattened = norm.cdf(X_out)
-        X_out = (1 - flatten_weight) * X_out + flatten_weight * X_flattened
+        X_out = _blend_flatten(X_out, flatten_weight)
         if method == 'flatten_plus_umap':
             umap_scaler = umap.UMAP(
                 n_components=2,
@@ -1167,16 +1166,138 @@ def _build_scaler(method, X, n_quantiles=100, flatten_weight=1):
     return X_out, scaler
 
 
+def _blend_flatten(X_out, flatten_weight):
+    """Blend a power-transformed array with its normal CDF ('flatten')."""
+    X_flattened = norm.cdf(X_out)
+    return (1 - flatten_weight) * X_out + flatten_weight * X_flattened
+
+
+_UNFITTABLE_METHODS = ('umap', 'flatten_plus_umap', 'l2')
+
+
+class FittedNormalizer:
+    """Scaling fitted by :func:`normalize_data`, reapplied to new data.
+
+    Holds the fitted scalers and post steps of one normalize_data call so a
+    second dataset can be put on the same scale without new statistics.
+    Picklable, so it can be checkpointed and wired between steps.
+
+    Args:
+        method (str): Normalization method of the Sv group.
+        flatten_weight (float): CDF blending weight for 'flatten'.
+        feature_labels (list[str]): Feature coordinate values, in order.
+        sv_columns (list[int]): Column indices scaled by *sv_scaler*.
+        sv_scaler: Fitted scikit-learn scaler for the Sv group.
+        group_scalers (dict): Feature label to ``(column, method, scaler)``
+            for per_group_methods columns.
+        shift_amount (float): Amount added by shift_positive, 0 when none.
+        feature_weights (array-like or None): Per-feature multipliers.
+
+    Raises:
+        ValueError: For methods whose fit cannot be reapplied: 'umap',
+            'flatten_plus_umap', 'l2', and pooled (per_feature=False)
+            scaling, which has no scaler object.
+    """
+
+    def __init__(self, method, flatten_weight, feature_labels, sv_columns,
+                 sv_scaler, group_scalers, shift_amount, feature_weights):
+        if method in _UNFITTABLE_METHODS:
+            raise ValueError(
+                f"Normalization method '{method}' cannot be reapplied to new "
+                "data: UMAP embeddings and L2 row scaling have no fitted "
+                "transform to carry over."
+            )
+        if sv_scaler is None:
+            raise ValueError(
+                "Pooled normalization (per_feature=False) cannot be reapplied "
+                "to new data: it keeps no scaler object."
+            )
+        for label, (_, group_method, _) in group_scalers.items():
+            if group_method in _UNFITTABLE_METHODS:
+                raise ValueError(
+                    f"per_group_methods['{label}'] = '{group_method}' cannot "
+                    "be reapplied to new data."
+                )
+        self.method = method
+        self.flatten_weight = flatten_weight
+        self.feature_labels = [str(label) for label in feature_labels]
+        self.sv_columns = list(sv_columns)
+        self.sv_scaler = sv_scaler
+        self.group_scalers = dict(group_scalers)
+        self.shift_amount = float(shift_amount or 0.0)
+        self.feature_weights = (
+            None if feature_weights is None else np.asarray(feature_weights)
+        )
+
+    def transform(self, X):
+        """Apply the fitted scaling to a feature matrix.
+
+        Args:
+            X (np.ndarray): Shape ``(n_samples, n_features)`` with the
+                columns in *feature_labels* order.
+
+        Returns:
+            np.ndarray: Normalized matrix of the same shape.
+        """
+        X = np.asarray(X)
+        if X.ndim != 2 or X.shape[1] != len(self.feature_labels):
+            raise ValueError(
+                f"Expected {len(self.feature_labels)} feature columns, "
+                f"got array of shape {X.shape}"
+            )
+        X_normalized = np.empty(X.shape, dtype=float)
+        X_sv = self.sv_scaler.transform(X[:, self.sv_columns])
+        if self.method == 'flatten':
+            X_sv = _blend_flatten(X_sv, self.flatten_weight)
+        X_normalized[:, self.sv_columns] = X_sv
+        for column, group_method, scaler in self.group_scalers.values():
+            col = scaler.transform(X[:, column:column + 1])
+            if group_method == 'flatten':
+                col = _blend_flatten(col, self.flatten_weight)
+            X_normalized[:, column] = col[:, 0]
+        if self.shift_amount:
+            X_normalized = X_normalized + self.shift_amount
+        if self.feature_weights is not None:
+            X_normalized = X_normalized * self.feature_weights
+        return X_normalized
+
+
+def _store_normalized_data(ds_ml_ready, X_normalized, dataset_name,
+                           normalization_name, feature_dim_name):
+    """Store a normalized matrix beside its source ML data."""
+    source_sample_index_coord_name = f'{dataset_name}_sample_index'
+    normalized_data_name = f'{dataset_name}_{normalization_name}'
+
+    ml_data_normalized = xr.DataArray(
+        X_normalized,
+        dims=[source_sample_index_coord_name, feature_dim_name],
+        coords={
+            source_sample_index_coord_name: ds_ml_ready[dataset_name].coords[source_sample_index_coord_name],
+            feature_dim_name: ds_ml_ready[dataset_name].coords[feature_dim_name],
+        },
+    )
+
+    ds_ml_ready[normalized_data_name] = ml_data_normalized
+    logger.info("Stored normalized data as '%s'.", normalized_data_name)
+    return ds_ml_ready
+
+
 def normalize_data(ds_ml_ready, method='standard', pre_l2_method='standard',
                   shift_positive=False, per_feature=True, dataset_name='ml_data_clean',
                   normalization_name=None, feature_weights=None, n_quantiles=100,
-                  flatten_weight=1, per_group_methods=None):
+                  flatten_weight=1, per_group_methods=None, normalizer=None,
+                  return_normalizer=False):
     """Normalize flattened ML data using a variety of scaling methods.
 
     Supports per-feature and global normalization, optional L2 row
     normalization with a configurable pre-scaler, power-transform
     flattening, UMAP embedding, feature weighting, and per-group method
     overrides for auxiliary features.
+
+    With *normalizer* given, nothing is fitted: the scaling it holds is
+    applied to this dataset, so a second dataset lands on the scale of the
+    first. The feature coordinate must match the one the normalizer was
+    fitted on.
 
     Args:
         ds_ml_ready (xr.Dataset): Dataset produced by reshape_data_for_ml.
@@ -1217,12 +1338,24 @@ def normalize_data(ds_ml_ready, method='standard', pre_l2_method='standard',
                 }
 
             Defaults to None (all features use *method*).
+        normalizer (FittedNormalizer or None): Scaling fitted on another
+            dataset to apply here instead of fitting. Defaults to None.
+        return_normalizer (bool): Also return the FittedNormalizer, fitted
+            here or passed in. Defaults to False.
 
     Returns:
-        xr.Dataset: Dataset with the normalized data added.
+        xr.Dataset: Dataset with the normalized data added. With
+        *return_normalizer*, a ``(dataset, normalizer)`` tuple.
+
+    Raises:
+        ValueError: If *normalizer* was fitted on a different feature
+            coordinate, or if *return_normalizer* is set for a method that
+            cannot be reapplied (see :class:`FittedNormalizer`).
     """
     # --- Default normalization_name ---
     if normalization_name is None:
+        if normalizer is not None:
+            method = normalizer.method
         if method == 'l2':
             normalization_name = f'l2_{pre_l2_method}_normalized' if pre_l2_method != 'none' else 'l2_normalized'
         else:
@@ -1234,6 +1367,29 @@ def normalize_data(ds_ml_ready, method='standard', pre_l2_method='standard',
     feature_dim_name = [dim for dim in source_data.dims if dim != f'{dataset_name}_sample_index'][0]
     all_feature_labels = list(source_data.coords[feature_dim_name].values)
     auxiliary_features = list(source_data.attrs.get('auxiliary_features', []))
+
+    # ------------------------------------------------------------------ #
+    #  Transform-only path                                                #
+    # ------------------------------------------------------------------ #
+    if normalizer is not None:
+        incoming_labels = [str(label) for label in all_feature_labels]
+        if incoming_labels != normalizer.feature_labels:
+            raise ValueError(
+                "The normalizer was fitted on features "
+                f"{normalizer.feature_labels} but this dataset has "
+                f"{incoming_labels}; the two must match exactly."
+            )
+        X_normalized = normalizer.transform(X_clean)
+        logger.info(
+            "Applied fitted '%s' normalizer to %s samples without refitting.",
+            normalizer.method, f"{len(X_clean):,}",
+        )
+        ds_ml_ready = _store_normalized_data(
+            ds_ml_ready, X_normalized, dataset_name, normalization_name, feature_dim_name
+        )
+        if return_normalizer:
+            return ds_ml_ready, normalizer
+        return ds_ml_ready
 
     # --- Warn for auxiliary features not covered by per_group_methods ---
     if per_group_methods is not None and auxiliary_features:
@@ -1252,6 +1408,8 @@ def normalize_data(ds_ml_ready, method='standard', pre_l2_method='standard',
     group_col_map = {lbl: i for i, lbl in enumerate(all_feature_labels) if lbl in per_group_methods}
 
     X_sv = X_clean[:, sv_col_indices]  # columns handled by default method / global
+    sv_scaler = None
+    group_scalers = {}
 
     # ------------------------------------------------------------------ #
     #  Normalize the Sv group                                             #
@@ -1341,9 +1499,10 @@ def normalize_data(ds_ml_ready, method='standard', pre_l2_method='standard',
     for feature_label, col_idx in group_col_map.items():
         aux_method = per_group_methods[feature_label]
         col = X_clean[:, col_idx:col_idx + 1]
-        col_normalized, _ = _build_scaler(
+        col_normalized, group_scaler = _build_scaler(
             aux_method, col, n_quantiles=n_quantiles, flatten_weight=flatten_weight
         )
+        group_scalers[feature_label] = (col_idx, aux_method, group_scaler)
         X_normalized[:, col_idx] = col_normalized[:, 0]
         logger.info(
             "Normalized auxiliary feature '%s' with method '%s'.",
@@ -1386,22 +1545,43 @@ def normalize_data(ds_ml_ready, method='standard', pre_l2_method='standard',
     # ------------------------------------------------------------------ #
     #  Store result                                                       #
     # ------------------------------------------------------------------ #
-    source_sample_index_coord_name = f'{dataset_name}_sample_index'
-    normalized_data_name = f'{dataset_name}_{normalization_name}'
-
-    ml_data_normalized = xr.DataArray(
-        X_normalized,
-        dims=[source_sample_index_coord_name, feature_dim_name],
-        coords={
-            source_sample_index_coord_name: ds_ml_ready[dataset_name].coords[source_sample_index_coord_name],
-            feature_dim_name: ds_ml_ready[dataset_name].coords[feature_dim_name],
-        },
+    ds_ml_ready = _store_normalized_data(
+        ds_ml_ready, X_normalized, dataset_name, normalization_name, feature_dim_name
     )
 
-    ds_ml_ready[normalized_data_name] = ml_data_normalized
-    logger.info("Stored normalized data as '%s'.", normalized_data_name)
+    if return_normalizer:
+        fitted = FittedNormalizer(
+            method=method,
+            flatten_weight=flatten_weight,
+            feature_labels=all_feature_labels,
+            sv_columns=sv_col_indices,
+            sv_scaler=sv_scaler,
+            group_scalers=group_scalers,
+            shift_amount=normalization_info.get('shift_amount', 0.0),
+            feature_weights=normalization_info.get('feature_weights'),
+        )
+        return ds_ml_ready, fitted
 
     return ds_ml_ready
+
+
+def normalize_ml_data_step(ds_ml_ready, normalizer=None, **kwargs):
+    """Recipe step wrapping :func:`normalize_data` with a normalizer port.
+
+    Args:
+        ds_ml_ready (xr.Dataset): Dataset produced by reshape_data_for_ml.
+        normalizer (FittedNormalizer or None): Scaling from an earlier
+            normalize step to apply instead of fitting. Defaults to None.
+        **kwargs: Keyword arguments of :func:`normalize_data`.
+
+    Returns:
+        dict: ``'ds_normalized'`` (the dataset) and ``'normalizer'`` (the
+        FittedNormalizer fitted here or passed in).
+    """
+    ds_normalized, fitted = normalize_data(
+        ds_ml_ready, normalizer=normalizer, return_normalizer=True, **kwargs
+    )
+    return {'ds_normalized': ds_normalized, 'normalizer': fitted}
 
 
 def extract_valid_samples_for_sklearn(ds_ml_ready, specific_data_name=None, dataset_name='ml_data_clean'):
@@ -1875,6 +2055,105 @@ def extract_cluster_statistics(ds_ml_ready, cluster_data_name, dataset_name='ml_
     return stats_dict
 
 
+def _table_value(value):
+    """Convert a statistic to a JSON value: NumPy to Python, NaN to None."""
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    return value
+
+
+def cluster_statistics_table(ds_normalized, ml_result_name, dataset_name,
+                             sv_data_var='Sv', compute_pairwise_diffs=True):
+    """Per-cluster statistics as a JSON table (schema ``aa-table/1``).
+
+    Wraps :func:`extract_cluster_statistics`. Each row is a cluster or the
+    noise group (``group_id`` -1) with its sample count and share, then the
+    mean, std, min and max of every feature. Columns carrying a feature
+    statistic are tagged with ``feature`` and ``stat``; ``features`` lists
+    each feature with its display label and kind ('sv' or 'difference').
+
+    Args:
+        ds_normalized (xr.Dataset): Dataset holding the embedded cluster
+            labels and the source Sv variable.
+        ml_result_name (str): Name of the embedded clustering result.
+        dataset_name (str): Base ML dataset name.
+        sv_data_var (str): Sv variable the statistics are taken from, or
+            'ml_features' for the flattened ML features. Defaults to 'Sv'.
+        compute_pairwise_diffs (bool): Add each channel's difference from the
+            second-lowest frequency as a feature. Defaults to True.
+
+    Returns:
+        dict: JSON-serialisable table with keys 'schema', 'title',
+        'description', 'group_column', 'columns', 'features', 'rows' and
+        'source'.
+    """
+    stats = extract_cluster_statistics(
+        ds_normalized,
+        ml_result_name,
+        dataset_name=dataset_name,
+        sv_data_var=sv_data_var,
+        compute_pairwise_diffs=compute_pairwise_diffs,
+    )
+    use_ml_features = sv_data_var is None or sv_data_var == ML_FEATURE_STATS_SOURCE
+    unit = None if use_ml_features else 'dB'
+    feature_names = [str(name) for name in stats['feature_coords']]
+    feature_labels = [str(label) for label in stats['feature_labels']]
+
+    columns = [
+        {'name': 'group', 'type': 'str'},
+        {'name': 'group_id', 'type': 'int'},
+        {'name': 'n_samples', 'type': 'int'},
+        {'name': 'percentage', 'type': 'float', 'unit': '%'},
+    ]
+    features = []
+    for name, label in zip(feature_names, feature_labels):
+        kind = 'difference' if name.endswith('_diff') else 'sv'
+        features.append({'name': name, 'label': label, 'kind': kind})
+        for stat in ('mean', 'std', 'min', 'max'):
+            columns.append({
+                'name': f'{name}_{stat}', 'type': 'float', 'unit': unit,
+                'feature': name, 'stat': stat,
+            })
+
+    groups = list(stats['cluster_stats'])
+    if stats['noise_stats'] is not None:
+        groups.append(stats['noise_stats'])
+    rows = []
+    for group in groups:
+        group_id = int(group['Cluster'])
+        row = {
+            'group': 'Noise' if group_id < 0 else f'Cluster {group_id}',
+            'group_id': group_id,
+            'n_samples': int(group['N_Samples']),
+            'percentage': _table_value(float(group['Percentage'])),
+        }
+        for name in feature_names:
+            for stat in ('mean', 'std', 'min', 'max'):
+                row[f'{name}_{stat}'] = _table_value(group[f'{name}_{stat}'])
+        rows.append(row)
+
+    metadata = stats['metadata']
+    return {
+        'schema': 'aa-table/1',
+        'title': 'Cluster statistics',
+        'description': str(stats['data_description']),
+        'group_column': 'group',
+        'columns': columns,
+        'features': features,
+        'rows': rows,
+        'source': {
+            'ml_result_name': ml_result_name,
+            'dataset_name': dataset_name,
+            'sv_data_var': sv_data_var,
+            'n_total_samples': int(metadata['n_total_samples']),
+            'n_clusters': int(metadata['n_clusters']),
+            'n_noise': int(metadata['n_noise']),
+        },
+    }
+
+
 def remove_noise(
         ds_Sv,
         ping_num=5,
@@ -2340,6 +2619,7 @@ def assign_clusters_by_prediction(
         ml_result_name=None,
         batch_size=200000,
         keep_model=True,
+        predict_all=False,
         ):
     """Extend a subsampled clustering to every point in the dataset.
 
@@ -2381,6 +2661,10 @@ def assign_clusters_by_prediction(
             Defaults to 200000.
         keep_model (bool): Pass the model through on ``clustering_model``.
             False returns None there so the step checkpoints without pickle.
+        predict_all (bool): Predict a label for every row of *ds_normalized*
+            and keep none of the fitted labels. For labelling a dataset the
+            model was not fitted on, normalized with the same
+            FittedNormalizer. Defaults to False.
 
     Returns:
         dict: With keys 'clustering_results' (an xr.Dataset covering every
@@ -2410,7 +2694,15 @@ def assign_clusters_by_prediction(
     )
 
     n_missing = len(all_indices) - len(fitted_indices)
-    if n_missing <= 0:
+    if predict_all:
+        logger.info(
+            "Predicting labels for all %s samples from the fitted model",
+            f"{len(all_indices):,}"
+        )
+        labels = predict_cluster_labels(clustering_model, X, batch_size=batch_size)
+        fitted_indices = fitted_indices[:0]
+        n_missing = len(all_indices)
+    elif n_missing <= 0:
         logger.info(
             "Clustering already covers all %s samples; nothing to predict",
             f"{len(all_indices):,}"
@@ -2449,7 +2741,7 @@ def assign_clusters_by_prediction(
         'n_noise': n_noise,
         'n_fitted': int(len(fitted_indices)),
         'n_predicted': int(max(n_missing, 0)),
-        'label_source': 'fit + approximate_predict',
+        'label_source': 'approximate_predict' if predict_all else 'fit + approximate_predict',
     })
     if ml_result_name is not None:
         result['ml_result_name'] = ml_result_name

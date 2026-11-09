@@ -302,3 +302,107 @@ def test_keep_model_false_leaves_the_model_port_empty(monkeypatch):
         dropped['clustering_results']['labels'].values,
         kept['clustering_results']['labels'].values,
     )
+
+
+# ---------------------------------------------------------------------------
+# predict_all: label a dataset the model was not fitted on
+# ---------------------------------------------------------------------------
+
+
+def _normalized_dataset(X, start_index=0):
+    sample_dim = 'ml_data_clean_sample_index'
+    feature_dim = 'feature_ml_data_clean'
+    n_samples = len(X)
+    coords = {
+        sample_dim: np.arange(start_index, start_index + n_samples),
+        feature_dim: np.array(['f1', 'f2']),
+    }
+    ds = xr.Dataset({
+        'ml_data_clean': xr.DataArray(X, dims=[sample_dim, feature_dim], coords=coords),
+        'ml_data_clean_normalized_data': xr.DataArray(
+            X, dims=[sample_dim, feature_dim], coords=coords
+        ),
+    })
+    ds['ml_data_clean_sample_index_to_grid_index'] = xr.DataArray(
+        np.arange(n_samples), dims=[sample_dim]
+    )
+    return ds
+
+
+def _fit_on_blobs():
+    X_a = _two_blobs(seed=0)
+    model = hdbscan.HDBSCAN(min_cluster_size=15, prediction_data=True)
+    model.fit(X_a)
+    return model, _fitted_result(model.labels_, np.arange(len(X_a)))
+
+
+def test_predict_all_labels_a_second_dataset_with_the_fitted_model():
+    model, fitted = _fit_on_blobs()
+    X_b = _two_blobs(n_per_blob=100, seed=1)
+
+    out = ml.assign_clusters_by_prediction(
+        _normalized_dataset(X_b, start_index=1000),
+        fitted,
+        clustering_model=model,
+        dataset_name='ml_data_clean',
+        normalization_name='normalized_data',
+        predict_all=True,
+    )
+
+    result = out['clustering_results']
+    np.testing.assert_array_equal(result['sample_indices'].values, np.arange(1000, 1200))
+    np.testing.assert_array_equal(
+        result['labels'].values, ml_algorithms.predict_cluster_labels(model, X_b)
+    )
+    assert result.attrs['label_source'] == 'approximate_predict'
+    assert result.attrs['n_fitted'] == 0
+    assert result.attrs['n_predicted'] == 200
+    assert out['cluster_labels'] == sorted(set(model.labels_[model.labels_ >= 0]))
+    assert set(out) == {'clustering_results', 'clustering_model', 'cluster_labels'}
+
+
+def test_predict_all_skips_the_sample_index_check():
+    """The fitted indices belong to another dataset, so they must be ignored."""
+    model, fitted = _fit_on_blobs()
+    X_b = _two_blobs(n_per_blob=20, seed=1)
+
+    with pytest.raises(ValueError, match="do not belong together"):
+        ml.assign_clusters_by_prediction(
+            _normalized_dataset(X_b, start_index=1000),
+            fitted,
+            clustering_model=model,
+            dataset_name='ml_data_clean',
+            normalization_name='normalized_data',
+        )
+
+    out = ml.assign_clusters_by_prediction(
+        _normalized_dataset(X_b, start_index=1000),
+        fitted,
+        clustering_model=model,
+        dataset_name='ml_data_clean',
+        normalization_name='normalized_data',
+        predict_all=True,
+    )
+    assert out['clustering_results']['labels'].values.shape == (40,)
+
+
+def test_run_hdbscan_fits_with_prediction_data():
+    """run_hdbscan's fit must carry prediction data for predict_all to work."""
+    X = _two_blobs()
+    results = ml_algorithms.apply_dbscan_clustering(
+        X,
+        sample_indices=np.arange(len(X)),
+        eps_values=[0.004],
+        min_samples_values=[2],
+        sample_size=len(X),
+        calculate_silhouette=False,
+        silhouette_sample_size=100,
+        metric="euclidean",
+        use_hdbscan=True,
+        min_cluster_size=15,
+        cluster_selection_method="leaf",
+    )
+
+    model = next(iter(results.values()))['model']
+    assert model.prediction_data_ is not None
+    assert ml_algorithms.predict_cluster_labels(model, X[:5]).shape == (5,)
