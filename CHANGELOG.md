@@ -11,7 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initial project structure from NOAA Fisheries AA-SI Python template
 
 ### Changed
-- Nothing yet
+- `umap` is imported only by the `umap` and `flatten_plus_umap` normalization
+  methods, so importing `aa_si_ml` no longer pays its numba compile time
 
 ### Deprecated
 - Nothing yet

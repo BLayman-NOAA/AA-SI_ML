@@ -12,7 +12,6 @@ from sklearn.preprocessing import (
     Normalizer, PowerTransformer, QuantileTransformer,
 )
 from scipy.stats import norm
-import umap
 import echopype as ep
 from aa_si_visualization import echogram
 from aa_si_utils import utils
@@ -1135,6 +1134,8 @@ def _build_scaler(method, X, n_quantiles=100, flatten_weight=1):
         n_q = min(len(X), n_quantiles)
         scaler = QuantileTransformer(output_distribution='uniform', n_quantiles=n_q)
     elif method == 'umap':
+        import umap
+
         n_components = 2
         scaler = umap.UMAP(
             n_components=n_components,
@@ -1153,6 +1154,8 @@ def _build_scaler(method, X, n_quantiles=100, flatten_weight=1):
     if method in ('flatten', 'flatten_plus_umap'):
         X_out = _blend_flatten(X_out, flatten_weight)
         if method == 'flatten_plus_umap':
+            import umap
+
             umap_scaler = umap.UMAP(
                 n_components=2,
                 n_neighbors=30,
